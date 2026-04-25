@@ -1,0 +1,1185 @@
+import os
+import json
+import re
+import uuid
+import sqlite3
+import requests
+import numpy as np
+import faiss
+import chromadb
+from bs4 import BeautifulSoup
+from flask import Flask, request, render_template_string
+import anthropic
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+import asyncio
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# ─────────────────────────────────────────────
+# INITIALISE
+# ─────────────────────────────────────────────
+load_dotenv()
+
+claude   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Persistent ChromaDB — survives restarts
+chroma_client    = chromadb.PersistentClient(path="./chroma_db")
+notes_collection = chroma_client.get_or_create_collection("clinical_notes")
+
+app = Flask(__name__)
+app.jinja_env.filters["fromjson"] = json.loads
+
+# ─────────────────────────────────────────────
+# CLINICAL GUIDELINES KNOWLEDGE BASE
+# ─────────────────────────────────────────────
+GUIDELINES = [
+    # DIABETES
+    "Diabetes: HbA1c should be measured every 3 months if uncontrolled (>8%), every 6 months if stable.",
+    "Diabetes: Annual diabetic eye exam (fundoscopy/retinal screening) is required for all diabetic patients.",
+    "Diabetes: Annual diabetic foot exam including monofilament sensation test is required.",
+    "Diabetes: Urine microalbumin/creatinine ratio should be checked annually to screen for nephropathy.",
+    "Diabetes: Blood pressure target for diabetic patients is <130/80 mmHg.",
+    "Diabetes: Statin therapy is recommended for all diabetic patients aged 40-75.",
+    "Diabetes: ACE inhibitor or ARB is recommended if microalbuminuria is present.",
+    "Diabetes: Referral to endocrinology if HbA1c remains >9% despite treatment.",
+    "Diabetes: Diabetes self-management education program enrollment is recommended at diagnosis.",
+    "Diabetes: Annual flu vaccination is recommended for all diabetic patients.",
+    # CONGESTIVE HEART FAILURE
+    "Heart Failure: ACE inhibitor or ARB therapy is recommended for all HFrEF patients (EF <40%).",
+    "Heart Failure: Beta-blocker therapy is recommended for all stable HFrEF patients.",
+    "Heart Failure: Aldosterone antagonist recommended for HFrEF patients with EF <35%.",
+    "Heart Failure: BNP or NT-proBNP should be measured to assess disease severity.",
+    "Heart Failure: Echocardiogram recommended to assess ejection fraction at diagnosis and after treatment changes.",
+    "Heart Failure: Daily weight monitoring and fluid restriction education is required.",
+    "Heart Failure: Cardiology referral is recommended for newly diagnosed heart failure.",
+    "Heart Failure: Annual flu and pneumococcal vaccination recommended for heart failure patients.",
+    "Heart Failure: Sodium restriction to <2g/day is recommended.",
+    "Heart Failure: 30-day readmission follow-up appointment is required post-discharge.",
+    # HYPERTENSION
+    "Hypertension: Blood pressure target is <130/80 mmHg for most patients per ACC/AHA guidelines.",
+    "Hypertension: First-line agents include thiazide diuretics, CCBs, ACE inhibitors, or ARBs.",
+    "Hypertension: Annual renal function (eGFR, creatinine) and electrolyte monitoring required.",
+    "Hypertension: Lifestyle modifications including DASH diet and exercise counseling are required.",
+    "Hypertension: EKG recommended to assess for LVH in newly diagnosed hypertensive patients.",
+    # CHRONIC KIDNEY DISEASE
+    "CKD: eGFR and urine albumin-creatinine ratio should be monitored every 3-6 months.",
+    "CKD: Blood pressure target for CKD patients is <130/80 mmHg.",
+    "CKD: ACE inhibitor or ARB recommended for CKD patients with proteinuria.",
+    "CKD: Nephrology referral recommended when eGFR falls below 30 mL/min.",
+    "CKD: Anemia workup (CBC, iron studies) recommended for CKD patients.",
+    "CKD: Dietary protein restriction and phosphate management counseling recommended.",
+    "CKD: Avoid NSAIDs and nephrotoxic medications in CKD patients.",
+    "CKD: Vaccination: Hepatitis B, flu, and pneumococcal vaccines recommended.",
+    # ASTHMA
+    "Asthma: Annual spirometry/pulmonary function test recommended to assess control.",
+    "Asthma: Inhaled corticosteroid is first-line controller therapy for persistent asthma.",
+    "Asthma: Asthma action plan should be documented and provided to patient.",
+    "Asthma: Referral to pulmonology if symptoms uncontrolled on moderate-dose ICS.",
+    # DYSLIPIDAEMIA
+    "Dyslipidaemia: Fasting lipid panel should be checked annually.",
+    "Dyslipidaemia: Statin therapy recommended for patients with cardiovascular risk >10% (10-year ASCVD risk).",
+    "Dyslipidaemia: LDL target <70 mg/dL for very high cardiovascular risk patients.",
+    "Dyslipidaemia: Lifestyle counseling on diet and exercise is required alongside pharmacotherapy.",
+]
+
+# Embed guidelines at startup
+print("Embedding clinical guidelines knowledge base...")
+guideline_embeddings = np.array(
+    [embedder.encode(g) for g in GUIDELINES], dtype="float32"
+)
+guideline_index = faiss.IndexFlatL2(guideline_embeddings.shape[1])
+guideline_index.add(guideline_embeddings)
+print(f"✅ {len(GUIDELINES)} guidelines embedded and indexed.")
+
+
+# ─────────────────────────────────────────────
+# SQLITE — Structured patient data store
+# Replace connection with BigQuery in Phase 3
+# ─────────────────────────────────────────────
+DB_PATH = "./patients.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS patients (
+            patient_id        TEXT PRIMARY KEY,
+            primary_diagnosis TEXT,
+            comorbidities     TEXT,
+            medications       TEXT,
+            key_findings      TEXT,
+            risk_flags        TEXT,
+            follow_up_actions TEXT,
+            risk_level        TEXT,
+            source_note       TEXT,
+            created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print(f"✅ SQLite database initialised at {DB_PATH}")
+
+def save_patient(summary, source_note):
+    patient_id = str(uuid.uuid4())[:8].upper()
+    flag_count = len(summary.get("risk_flags", []))
+    risk_level = "HIGH" if flag_count >= 3 else "MEDIUM" if flag_count >= 1 else "LOW"
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""
+        INSERT INTO patients (
+            patient_id, primary_diagnosis, comorbidities,
+            medications, key_findings, risk_flags,
+            follow_up_actions, risk_level, source_note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        patient_id,
+        summary.get("primary_diagnosis", ""),
+        json.dumps(summary.get("comorbidities", [])),
+        json.dumps(summary.get("medications", [])),
+        json.dumps(summary.get("key_findings", [])),
+        json.dumps(summary.get("risk_flags", [])),
+        json.dumps(summary.get("follow_up_actions", [])),
+        risk_level,
+        source_note
+    ))
+    conn.commit()
+    conn.close()
+    return patient_id
+
+def get_all_patients():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c    = conn.cursor()
+    c.execute("""
+        SELECT patient_id, primary_diagnosis, comorbidities,
+               medications, risk_flags, risk_level, created_at
+        FROM patients ORDER BY created_at DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_patient_by_id(patient_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c    = conn.cursor()
+    c.execute("SELECT * FROM patients WHERE patient_id = ?", (patient_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_patients_by_risk(risk_level):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c    = conn.cursor()
+    c.execute("""
+        SELECT patient_id, primary_diagnosis, risk_flags,
+               risk_level, created_at
+        FROM patients WHERE risk_level = ?
+        ORDER BY created_at DESC
+    """, (risk_level,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_patient_stats():
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM patients")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM patients WHERE risk_level = 'HIGH'")
+    high = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM patients WHERE risk_level = 'MEDIUM'")
+    medium = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM patients WHERE risk_level = 'LOW'")
+    low = c.fetchone()[0]
+    conn.close()
+    return {"total": total, "high": high, "medium": medium, "low": low}
+
+init_db()
+
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(Exception),
+    reraise=True
+)
+def get_claude_response(system_prompt, user_prompt, max_tokens=1500, temperature=0.0):
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"Claude API error (will retry): {e}")
+        raise
+
+def clean_json(text):
+    text = text.strip()
+    text = re.sub(r"^```json", "", text)
+    text = re.sub(r"^```",     "", text)
+    text = re.sub(r"```$",     "", text)
+    return text.strip()
+
+def chunk_text(text, chunk_size=512):
+    words        = text.split()
+    approx_words = int(chunk_size / 1.3)
+    if len(words) <= approx_words:
+        return [text]
+    return [
+        " ".join(words[i:i+approx_words])
+        for i in range(0, len(words), approx_words)
+    ]
+
+def retrieve_relevant_guidelines(query, k=10):
+    query_vec = np.array([embedder.encode(query)], dtype="float32")
+    D, I      = guideline_index.search(query_vec, k=k)
+    return [GUIDELINES[i] for i in I[0]]
+
+def scrape_url_content(url):
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Try MTSamples-specific selectors in order
+        # Try MTSamples-specific selectors in order
+        for selector in [
+            {"id": "fullText"},
+            {"class": "transcription"},
+            {"class": "sample-content"},
+            {"class": "sample"},
+            {"id": "sample-text"},
+            {"class": "col w-100 p-2"},   # ← current MTSamples structure
+        ]:
+            div = soup.find("div", selector)
+            if div:
+                text = div.get_text(separator="\n").strip()
+                if len(text.split()) > 50:
+                    return text
+
+        # Fallback — grab paragraphs but skip legal notice
+        paragraphs = soup.find_all("p")
+        texts = []
+        for p in paragraphs:
+            t = p.get_text().strip()
+            if "Legal & Usage Notice" in t:
+                continue
+            if "MTHelpLine" in t:
+                continue
+            if len(t) > 30:
+                texts.append(t)
+        text = "\n".join(texts).strip()
+        return text if len(text.split()) > 50 else None
+
+    except Exception:
+        return None
+
+async def scrape_url_async(client, url):
+    """Async version of scraper — runs concurrently with other URLs"""
+    try:
+        resp = await client.get(url, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        main = soup.select_one("div.col-lg-9.mainContent")
+        if main:
+            text = main.get_text(separator=" ").strip()
+            text = re.sub(r"\s+", " ", text)
+            match = re.search(r"Sample Name:", text)
+            if not match:
+                match = re.search(
+                    r"(REASON FOR VISIT|CHIEF COMPLAINT|HISTORY OF PRESENT ILLNESS|"
+                    r"SUBJECTIVE|PREOPERATIVE DIAGNOSIS|ADMISSION DIAGNOSIS|"
+                    r"CONSULTATION|DISCHARGE SUMMARY|PROCEDURE)", text
+                )
+            if match:
+                text = text[match.start():]
+            noise = [
+                "Intended for: Medical transcription students, transcriptionists, and educators practicing clinical documentation formats in General Medicine.",
+                "Discover more", "Newspapers", "News",
+                "Secure transcription solutions", "Medical transcription software",
+                "Nasal Sprays", "Drugs & Medications", "Health Conditions",
+            ]
+            for n in noise:
+                text = text.replace(n, "")
+            for stop in ["About This Sample:", "Legal & Usage Notice",
+                         "Related Samples", "Keywords:", "Go Back to"]:
+                if stop in text:
+                    text = text[:text.index(stop)]
+                    break
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text.split()) > 50:
+                return url, text, None
+
+        return url, None, "No clinical content found"
+
+    except Exception as e:
+        return url, None, str(e)
+
+
+async def scrape_urls_async(urls):
+    """Launch all URL scrapes at the same time"""
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0"},
+        follow_redirects=True
+    ) as client:
+        tasks = [scrape_url_async(client, url) for url in urls]
+        results = await asyncio.gather(*tasks)
+    return results
+
+def index_note(url, text, patient_id=None):
+    chunks = chunk_text(text, chunk_size=512)
+    for i, chunk in enumerate(chunks):
+        chunk_id  = f"{abs(hash(url))}_{i}"
+        embedding = embedder.encode(chunk).tolist()
+        notes_collection.upsert(
+            ids=[chunk_id],
+            embeddings=[embedding],
+            documents=[chunk],
+            metadatas=[{"url": url, "chunk": i, "patient_id": patient_id or ""}]
+        )
+    return len(chunks)
+
+def search_notes(query, top_k=5):
+    count = notes_collection.count()
+    if count == 0:
+        return []
+    query_vec = embedder.encode(query).tolist()
+    results   = notes_collection.query(
+        query_embeddings=[query_vec],
+        n_results=min(top_k, count)
+    )
+    if not results["ids"][0]:
+        return []
+    return list(zip(results["documents"][0], results["metadatas"][0]))
+
+def base_context(**kwargs):
+    stats = get_patient_stats()
+    defaults = dict(
+        summary=None, gaps=None,
+        guideline_count=len(GUIDELINES),
+        notes_count=notes_collection.count(),
+        ingest_results=None,
+        search_results=None,
+        search_query=None,
+        note_text=None,
+        patient_id=None,
+        patients=None,
+        stats=stats,
+        active_tab="summarize",
+        ask_question=None,      # ← add these
+        ask_answer=None,
+        ask_sources=None,
+        ask_chunks=None
+    )
+    defaults.update(kwargs)
+    return defaults
+
+
+# ─────────────────────────────────────────────
+# PATIENT DETAIL TEMPLATE
+# ─────────────────────────────────────────────
+PATIENT_DETAIL_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Patient {{ patient.patient_id }}</title>
+  <style>
+    body  { font-family:Arial,sans-serif; max-width:860px; margin:40px auto; padding:0 20px; background:#f5f7fa; }
+    h1    { color:#1a365d; }
+    .card { background:white; border-radius:8px; padding:20px; margin:16px 0; border-left:4px solid #2b6cb0; }
+    .label{ font-weight:bold; color:#4a5568; font-size:13px; text-transform:uppercase; letter-spacing:0.5px; display:block; margin-bottom:6px; }
+    .tag  { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; margin:2px; }
+    .tag-high   { background:#fed7d7; color:#c53030; }
+    .tag-medium { background:#fefcbf; color:#744210; }
+    .tag-low    { background:#c6f6d5; color:#22543d; }
+    ul { padding-left:20px; } li { margin:6px 0; }
+    .back { color:#2b6cb0; text-decoration:none; font-size:14px; }
+    pre   { background:#edf2f7; padding:16px; border-radius:8px; font-size:12px; white-space:pre-wrap; word-wrap:break-word; }
+    .section { margin-top:16px; }
+  </style>
+</head>
+<body>
+  <a class="back" href="/patients">← Back to Patients</a>
+  <h1>Patient {{ patient.patient_id }}</h1>
+  <p style="color:#718096; font-size:13px;">Added: {{ patient.created_at }}</p>
+
+  <div class="card">
+    <span class="tag {% if patient.risk_level == 'HIGH' %}tag-high{% elif patient.risk_level == 'MEDIUM' %}tag-medium{% else %}tag-low{% endif %}"
+      style="font-size:14px; padding:6px 16px;">
+      {{ patient.risk_level }} RISK
+    </span>
+    <div class="section">
+      <span class="label">Primary Diagnosis</span>
+      <p>{{ patient.primary_diagnosis }}</p>
+    </div>
+    <div class="section">
+      <span class="label">Comorbidities</span>
+      <ul>{% for c in patient.comorbidities %}<li>{{ c }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <span class="label">Medications</span>
+      <ul>{% for m in patient.medications %}<li>{{ m }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <span class="label">Key Clinical Findings</span>
+      <ul>{% for f in patient.key_findings %}<li>{{ f }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <span class="label">Risk Flags</span>
+      {% for r in patient.risk_flags %}
+        <span class="tag tag-high">⚠️ {{ r }}</span>
+      {% else %}
+        <span style="color:#276749;">✅ No risk flags</span>
+      {% endfor %}
+    </div>
+    <div class="section">
+      <span class="label">Follow-up Actions</span>
+      <ul>{% for a in patient.follow_up_actions %}<li>{{ a }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+  </div>
+
+  <div class="card" style="border-left-color:#718096;">
+    <span class="label">Original Clinical Note</span>
+    <pre style="margin-top:8px;">{{ patient.source_note }}</pre>
+  </div>
+</body>
+</html>
+"""
+
+
+# ─────────────────────────────────────────────
+# MAIN HTML TEMPLATE
+# ─────────────────────────────────────────────
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Clinical AI Assistant</title>
+  <style>
+    body   { font-family:Arial,sans-serif; max-width:960px; margin:40px auto; padding:0 20px; background:#f5f7fa; }
+    h1     { color:#1a365d; }
+    h2     { color:#2c5282; border-bottom:2px solid #bee3f8; padding-bottom:8px; }
+    textarea         { width:100%; height:200px; padding:10px; border:1px solid #cbd5e0; border-radius:6px; font-size:14px; }
+    input[type=text] { width:100%; padding:10px; border:1px solid #cbd5e0; border-radius:6px; font-size:14px; }
+    .btn        { background:#2b6cb0; color:white; padding:10px 24px; border:none; border-radius:6px; cursor:pointer; font-size:15px; margin-right:8px; }
+    .btn:hover  { background:#2c5282; }
+    .btn-green  { background:#276749; } .btn-green:hover  { background:#22543d; }
+    .btn-purple { background:#553c9a; } .btn-purple:hover { background:#44337a; }
+    .btn-orange { background:#c05621; } .btn-orange:hover { background:#9c4221; }
+    .btn-red    { background:#c53030; } .btn-red:hover    { background:#9b2c2c; }
+    .btn-yellow { background:#b7791f; } .btn-yellow:hover { background:#975a16; }
+    .btn-sm     { padding:6px 14px; font-size:12px; }
+    .card       { background:white; border-radius:8px; padding:20px; margin:20px 0; border-left:4px solid #2b6cb0; }
+    .card-red   { border-left-color:#c53030; }
+    .card-purple{ border-left-color:#553c9a; }
+    .tag        { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; margin:2px; }
+    .tag-high   { background:#fed7d7; color:#c53030; }
+    .tag-medium { background:#fefcbf; color:#744210; }
+    .tag-low    { background:#c6f6d5; color:#22543d; }
+    ul { padding-left:20px; } li { margin:6px 0; }
+    .section    { margin:12px 0; }
+    .label      { font-weight:bold; color:#4a5568; font-size:13px; text-transform:uppercase; letter-spacing:0.5px; }
+    .tabs       { display:flex; margin-bottom:20px; flex-wrap:wrap; }
+    .tab        { padding:10px 18px; cursor:pointer; border:1px solid #cbd5e0; background:#edf2f7; font-weight:500; font-size:13px; }
+    .tab.active { background:#2b6cb0; color:white; border-color:#2b6cb0; }
+    .tab:first-child { border-radius:6px 0 0 6px; }
+    .tab:last-child  { border-radius:0 6px 6px 0; }
+    .form-panel { display:none; }
+    .form-panel.active { display:block; }
+    .controls   { display:flex; gap:32px; margin-bottom:16px; background:#edf2f7; padding:14px; border-radius:8px; flex-wrap:wrap; }
+    .control-group label { font-weight:600; font-size:13px; }
+    .control-group input[type=range] { width:200px; display:block; margin:4px 0; }
+    .hint       { font-size:11px; color:#718096; }
+    .count-badge{ background:#ebf8ff; color:#2b6cb0; padding:4px 12px; border-radius:12px; font-weight:600; font-size:13px; }
+    .stat-row   { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+    .stat-box   { padding:12px 18px; border-radius:8px; text-align:center; min-width:80px; }
+    .stat-box .num { font-size:24px; font-weight:700; }
+    .stat-box .lbl { font-size:11px; text-transform:uppercase; letter-spacing:0.5px; margin-top:2px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th    { background:#edf2f7; padding:10px; text-align:left; }
+    td    { padding:10px; border-bottom:1px solid #e2e8f0; }
+    .source-badge { font-size:11px; color:#718096; margin-bottom:6px; }
+    .note-text    { font-size:13px; color:#2d3748; line-height:1.6; }
+    .ingest-row   { padding:8px 0; border-bottom:1px solid #e2e8f0; font-size:13px; }
+    .saved-banner { background:#c6f6d5; border:1px solid #68d391; border-radius:8px; padding:12px 16px; margin-bottom:16px; color:#22543d; font-weight:600; }
+  </style>
+  <script>
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.form-panel').forEach(p => p.classList.remove('active'));
+      document.getElementById('tab-' + tab).classList.add('active');
+      document.getElementById('panel-' + tab).classList.add('active');
+    }
+  </script>
+</head>
+<body>
+
+  <h1>🏥 Clinical AI Assistant</h1>
+  <p style="color:#718096; margin-bottom:12px;">
+    Powered by Claude + RAG · SQLite patient store · ChromaDB vector search
+  </p>
+
+  <!-- STATS BAR -->
+  <div class="stat-row">
+    <div class="stat-box" style="background:#ebf8ff; color:#2b6cb0;">
+      <div class="num">{{ stats.total }}</div><div class="lbl">Patients</div>
+    </div>
+    <div class="stat-box" style="background:#fff5f5; color:#c53030;">
+      <div class="num">{{ stats.high }}</div><div class="lbl">High Risk</div>
+    </div>
+    <div class="stat-box" style="background:#fffff0; color:#b7791f;">
+      <div class="num">{{ stats.medium }}</div><div class="lbl">Medium Risk</div>
+    </div>
+    <div class="stat-box" style="background:#f0fff4; color:#276749;">
+      <div class="num">{{ stats.low }}</div><div class="lbl">Low Risk</div>
+    </div>
+    <div class="stat-box" style="background:#faf5ff; color:#553c9a;">
+      <div class="num">{{ notes_count }}</div><div class="lbl">Note Chunks</div>
+    </div>
+    <div class="stat-box" style="background:#fffaf0; color:#c05621;">
+      <div class="num">{{ guideline_count }}</div><div class="lbl">Guidelines</div>
+    </div>
+  </div>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <div class="tab {% if active_tab == 'summarize' %}active{% endif %}" id="tab-summarize" onclick="switchTab('summarize')">📋 Summarizer</div>
+    <div class="tab {% if active_tab == 'gaps' %}active{% endif %}"      id="tab-gaps"      onclick="switchTab('gaps')">🔍 Care Gaps</div>
+    <div class="tab {% if active_tab == 'ingest' %}active{% endif %}"    id="tab-ingest"    onclick="switchTab('ingest')">📥 Ingest Notes</div>
+    <div class="tab {% if active_tab == 'search' %}active{% endif %}"    id="tab-search"    onclick="switchTab('search')">🔎 Search Notes</div>
+    <div class="tab {% if active_tab == 'patients' %}active{% endif %}"  id="tab-patients"  onclick="switchTab('patients')">🗂️ Patients</div>
+    <div class="tab {% if active_tab == 'ask' %}active{% endif %}" id="tab-ask" onclick="switchTab('ask')">💬 Ask Notes</div>
+  </div>
+
+  <!-- ── SUMMARIZER ─────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'summarize' %}active{% endif %}" id="panel-summarize">
+    <form method="post" action="/summarize">
+      <p style="color:#4a5568;">
+        Paste any clinical note or discharge summary.
+        Structured data is automatically saved to the patient database.
+      </p>
+      <textarea name="clinical_note" placeholder="Paste clinical note here...">{{ note_text or '' }}</textarea>
+      <br><br>
+      <div class="controls">
+        <div class="control-group">
+          <label>🌡️ Temperature: <span id="ts">0.0</span></label>
+          <input type="range" name="temperature" min="0" max="1" step="0.1" value="0.0"
+            oninput="document.getElementById('ts').textContent=this.value">
+          <div class="hint">0.0 = precise &nbsp;|&nbsp; 1.0 = creative</div>
+        </div>
+        <div class="control-group">
+          <label>📏 Max Tokens: <span id="ms">1500</span></label>
+          <input type="range" name="max_tokens" min="200" max="2000" step="100" value="1500"
+            oninput="document.getElementById('ms').textContent=this.value">
+          <div class="hint">200 = brief &nbsp;|&nbsp; 2000 = detailed</div>
+        </div>
+      </div>
+      <button type="submit" class="btn">📋 Generate Summary + Save Patient</button>
+    </form>
+  </div>
+
+  <!-- ── CARE GAPS ───────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'gaps' %}active{% endif %}" id="panel-gaps">
+    <form method="post" action="/caregaps">
+      <p style="color:#4a5568;">
+        Paste a patient's clinical note. Checked against {{ guideline_count }} embedded clinical guidelines.
+      </p>
+      <textarea name="clinical_note" placeholder="Paste patient clinical note here...">{{ note_text or '' }}</textarea>
+      <br><br>
+      <div class="controls">
+        <div class="control-group">
+          <label>🌡️ Temperature: <span id="tg">0.0</span></label>
+          <input type="range" name="temperature" min="0" max="1" step="0.1" value="0.0"
+            oninput="document.getElementById('tg').textContent=this.value">
+          <div class="hint">0.0 = precise &nbsp;|&nbsp; 1.0 = creative</div>
+        </div>
+        <div class="control-group">
+          <label>📏 Max Tokens: <span id="mg">1500</span></label>
+          <input type="range" name="max_tokens" min="200" max="2000" step="100" value="1500"
+            oninput="document.getElementById('mg').textContent=this.value">
+          <div class="hint">200 = brief &nbsp;|&nbsp; 2000 = detailed</div>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-green">🔍 Identify Care Gaps</button>
+    </form>
+  </div>
+
+  <!-- ── INGEST ──────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'ingest' %}active{% endif %}" id="panel-ingest">
+    <form method="post" action="/ingest">
+      <p style="color:#4a5568;">
+        Paste one or more URLs — one per line. Works with MTSamples or any page with clinical text.<br>
+        <span class="hint">
+          Try: https://mtsamples.com/?page=site/sites/op=op&amp;type=Endocrinology&amp;sample=44-Diabetes+mellitus+Type+2
+        </span>
+      </p>
+      <textarea name="urls" placeholder="https://mtsamples.com/...&#10;https://mtsamples.com/..."></textarea>
+      <br><br>
+      <div style="margin-bottom:16px; padding:12px; background:#edf2f7; border-radius:8px; display:flex; align-items:center; gap:10px;">
+  <input type="checkbox" name="auto_summarize" id="auto_summarize" style="width:16px; height:16px;">
+  <label for="auto_summarize" style="font-size:14px; font-weight:500; cursor:pointer;">
+    🤖 Auto-summarize &amp; create patient records
+    <span style="font-size:11px; color:#718096; font-weight:400; display:block; margin-top:2px;">
+      Calls Claude for each URL — takes longer but creates patient records automatically
+    </span>
+  </label>
+</div>
+
+      <button type="submit" class="btn btn-purple">📥 Scrape &amp; Index Notes</button>
+    </form>
+    {% if ingest_results %}
+    <div class="card card-purple" style="margin-top:20px;">
+      <h2>📥 Ingest Results</h2>
+      {% for r in ingest_results %}
+      <div class="ingest-row">
+        {% if r.success %}
+  ✅ <b>{{ r.url[:70] }}</b> — {{ r.chunks }} chunks indexed
+  {% if r.patient_id %}
+    | 🧑‍⚕️ <a href="/patient/{{ r.patient_id }}" style="color:#553c9a;">Patient {{ r.patient_id }}</a>
+  {% endif %}
+  {% if r.error %}
+    | ⚠️ {{ r.error }}
+  {% endif %}
+{% else %}
+  ❌ <b>{{ r.url[:70] }}</b> — {{ r.error or 'Failed to scrape' }}
+{% endif %}
+      </div>
+      {% endfor %}
+      <p style="margin-top:12px;"><span class="count-badge">Total indexed: {{ notes_count }} chunks</span></p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ── SEARCH ──────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'search' %}active{% endif %}" id="panel-search">
+    <form method="post" action="/search">
+      <p style="color:#4a5568;">
+        Semantic search across all indexed notes.
+        <span class="count-badge">{{ notes_count }} chunks indexed</span>
+      </p>
+      <input type="text" name="query"
+        placeholder="e.g. patients with uncontrolled diabetes and high HbA1c"
+        value="{{ search_query or '' }}">
+      <br><br>
+      <button type="submit" class="btn btn-orange">🔎 Search</button>
+    </form>
+    {% if search_results %}
+    <div class="card" style="margin-top:20px;">
+      <h2>🔎 Search Results</h2>
+      <p style="color:#718096; font-size:13px;">Query: <i>"{{ search_query }}"</i> · {{ search_results|length }} results</p>
+      {% for doc, meta in search_results %}
+      <div style="margin:16px 0; padding:14px; background:#f7fafc; border-radius:6px; border-left:3px solid #2b6cb0;">
+        <div class="source-badge">
+          Source: {{ meta.url }}
+          {% if meta.patient_id %} | Patient: <a href="/patient/{{ meta.patient_id }}" style="color:#2b6cb0;">{{ meta.patient_id }}</a>{% endif %}
+          | Chunk {{ meta.chunk }}
+        </div>
+        <div class="note-text">{{ doc[:400] }}{% if doc|length > 400 %}...{% endif %}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if search_results is not none and search_results|length == 0 %}
+    <div class="card" style="margin-top:20px;">
+      <p style="color:#c53030;">No notes indexed yet. Use 📥 Ingest or 📋 Summarizer to add notes.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ── ASK ─────────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'ask' %}active{% endif %}" id="panel-ask">
+    <form method="post" action="/ask">
+      <p style="color:#4a5568;">
+        Ask any clinical question about your indexed notes. Claude will search and synthesize an answer.<br>
+        <span class="hint">
+          Try: "What insulin adjustments were made?" or "Which patients have uncontrolled hypertension?" 
+          or "Summarise the CKD patients in my notes"
+        </span>
+      </p>
+      <input type="text" name="question"
+        placeholder="Ask anything about your clinical notes..."
+        value="{{ ask_question or '' }}">
+      <br><br>
+      <button type="submit" class="btn" style="background:#0d6efd;">💬 Ask</button>
+    </form>
+
+    {% if ask_answer %}
+    <div class="card" style="margin-top:20px; border-left-color:#0d6efd;">
+      <h2>💬 Answer</h2>
+      <p style="color:#718096; font-size:13px;">
+        Question: <i>"{{ ask_question }}"</i>
+        &nbsp;|&nbsp; Based on {{ ask_sources|length }} source chunks
+      </p>
+      <div style="font-size:14px; color:#2d3748; line-height:1.8; white-space:pre-wrap;">{{ ask_answer }}</div>
+    </div>
+
+    {% if ask_sources %}
+    <div class="card" style="border-left-color:#718096; margin-top:0;">
+      <h3 style="color:#4a5568; font-size:14px; margin-bottom:12px;">📎 Sources Used</h3>
+      {% for num, url in ask_sources %}
+      <div style="font-size:12px; color:#718096; padding:4px 0; border-bottom:1px solid #f1f5f9;">
+        <b>Source {{ num }}:</b> {{ url }}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if ask_chunks %}
+    <details style="margin-top:12px;">
+      <summary style="cursor:pointer; font-size:13px; color:#2b6cb0; font-weight:600;">
+        📄 View raw chunks used ({{ ask_chunks|length }})
+      </summary>
+      {% for doc, meta in ask_chunks %}
+      <div style="margin:10px 0; padding:12px; background:#f7fafc; border-radius:6px; font-size:12px; color:#4a5568; border-left:3px solid #bee3f8;">
+        <div style="color:#718096; margin-bottom:4px;">{{ meta.url }} | Chunk {{ meta.chunk }}</div>
+        {{ doc[:300] }}{% if doc|length > 300 %}...{% endif %}
+      </div>
+      {% endfor %}
+    </details>
+    {% endif %}
+    {% endif %}
+  </div>
+
+  <!-- ── PATIENTS ────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'patients' %}active{% endif %}" id="panel-patients">
+    <div style="display:flex; gap:8px; margin-bottom:20px; flex-wrap:wrap;">
+      <a href="/patients" style="text-decoration:none;">
+        <button class="btn btn-sm">👥 All ({{ stats.total }})</button>
+      </a>
+      <a href="/patients?risk=HIGH" style="text-decoration:none;">
+        <button class="btn btn-sm btn-red">🔴 High Risk ({{ stats.high }})</button>
+      </a>
+      <a href="/patients?risk=MEDIUM" style="text-decoration:none;">
+        <button class="btn btn-sm btn-yellow">🟡 Medium Risk ({{ stats.medium }})</button>
+      </a>
+      <a href="/patients?risk=LOW" style="text-decoration:none;">
+        <button class="btn btn-sm btn-green">🟢 Low Risk ({{ stats.low }})</button>
+      </a>
+    </div>
+    {% if patients %}
+    <div class="card">
+      <h2>🗂️ Patient Records <span class="count-badge" style="margin-left:10px;">{{ patients|length }} shown</span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Patient ID</th><th>Primary Diagnosis</th><th>Risk Flags</th>
+            <th>Risk Level</th><th>Added</th><th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in patients %}
+          <tr>
+            <td style="font-weight:600; color:#2b6cb0;">{{ p.patient_id }}</td>
+            <td>{{ p.primary_diagnosis[:50] }}{% if p.primary_diagnosis|length > 50 %}...{% endif %}</td>
+            <td>
+              {% set flags = p.risk_flags | fromjson %}
+              {% for f in flags[:2] %}<span class="tag tag-high" style="font-size:10px;">{{ f[:25] }}</span>{% endfor %}
+              {% if flags|length > 2 %}<span style="font-size:11px; color:#718096;">+{{ flags|length - 2 }} more</span>{% endif %}
+            </td>
+            <td>
+              <span class="tag {% if p.risk_level == 'HIGH' %}tag-high{% elif p.risk_level == 'MEDIUM' %}tag-medium{% else %}tag-low{% endif %}">
+                {{ p.risk_level }}
+              </span>
+            </td>
+            <td style="color:#718096; font-size:12px;">{{ p.created_at[:16] }}</td>
+            <td><a href="/patient/{{ p.patient_id }}" style="color:#2b6cb0; font-size:12px;">View →</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% elif patients is not none %}
+    <div class="card">
+      <p style="color:#718096;">No patients yet. Use 📋 Summarizer to process clinical notes — each note is saved as a patient record.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ── SUMMARY RESULTS ────────────────────────────────────── -->
+  {% if summary %}
+  {% if patient_id %}
+  <div class="saved-banner">
+    ✅ Patient saved — ID: <b>{{ patient_id }}</b>
+    &nbsp;|&nbsp; <a href="/patient/{{ patient_id }}" style="color:#22543d;">View Patient Record →</a>
+  </div>
+  {% endif %}
+  <div class="card">
+    <h2>📋 Clinical Summary</h2>
+    <div class="section">
+      <div class="label">Primary Diagnosis</div>
+      <p>{{ summary.primary_diagnosis }}</p>
+    </div>
+    <div class="section">
+      <div class="label">Comorbidities</div>
+      <ul>{% for c in summary.comorbidities %}<li>{{ c }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <div class="label">Current Medications</div>
+      <ul>{% for m in summary.medications %}<li>{{ m }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <div class="label">Key Clinical Findings</div>
+      <ul>{% for f in summary.key_findings %}<li>{{ f }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <div class="label">Risk Flags</div>
+      {% for r in summary.risk_flags %}
+        <span class="tag tag-high">⚠️ {{ r }}</span>
+      {% else %}
+        <span style="color:#276749;">✅ No risk flags identified</span>
+      {% endfor %}
+    </div>
+    <div class="section">
+      <div class="label">Follow-up Actions</div>
+      <ul>{% for a in summary.follow_up_actions %}<li>{{ a }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ── GAP RESULTS ────────────────────────────────────────── -->
+  {% if gaps %}
+  <div class="card card-red">
+    <h2>🔍 Care Gap Analysis</h2>
+    <p style="color:#718096; font-size:13px;">Checked against {{ guideline_count }} embedded clinical guidelines</p>
+    {% if gaps.gaps %}
+      {% for gap in gaps.gaps %}
+      <div style="margin:16px 0; padding:14px; background:#fff5f5; border-radius:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <strong>{{ gap.gap }}</strong>
+          <span class="tag tag-{{ gap.priority | lower }}">{{ gap.priority }}</span>
+        </div>
+        <div style="margin-top:8px; font-size:13px; color:#4a5568;">
+          <b>Guideline:</b> {{ gap.guideline }}<br>
+          <b>Recommendation:</b> {{ gap.recommendation }}
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p style="color:#276749;">✅ No significant care gaps identified.</p>
+    {% endif %}
+    {% if gaps.summary %}
+    <div style="margin-top:16px; padding:12px; background:#ebf8ff; border-radius:6px;">
+      <b>Clinical Assessment:</b> {{ gaps.summary }}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+</body>
+</html>
+"""
+
+
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
+@app.route("/")
+def home():
+    return render_template_string(TEMPLATE, **base_context())
+
+
+@app.route("/summarize", methods=["POST"])
+def summarize():
+    note        = request.form.get("clinical_note", "").strip()
+    temperature = float(request.form.get("temperature", 0.0))
+    max_tokens  = int(request.form.get("max_tokens", 1500))
+
+    if not note:
+        return render_template_string(TEMPLATE, **base_context())
+
+    system_prompt = """You are a clinical documentation specialist.
+Extract structured information from the clinical note provided.
+Always respond with valid JSON only — no markdown, no explanation."""
+
+    user_prompt = f"""
+Extract the following from this clinical note and return as JSON:
+{{
+  "primary_diagnosis": "main diagnosis as a string",
+  "comorbidities": ["list", "of", "other", "conditions"],
+  "medications": ["list of current medications with doses if mentioned"],
+  "key_findings": ["list of important clinical findings, lab values, vitals"],
+  "risk_flags": ["list of urgent concerns that need immediate attention"],
+  "follow_up_actions": ["list of recommended follow-up actions mentioned or implied"]
+}}
+
+Clinical Note:
+{note}
+"""
+
+    raw = get_claude_response(system_prompt, user_prompt,
+                              max_tokens=max_tokens, temperature=temperature)
+    raw = clean_json(raw)
+
+    try:
+        summary = json.loads(raw)
+    except Exception:
+        return f"<h3>Parsing failed:</h3><pre>{raw}</pre>"
+
+    # Save to SQLite — structured layer
+    patient_id = save_patient(summary, note)
+
+    # Save to ChromaDB — vector layer, linked to patient_id
+    flag_count = len(summary.get("risk_flags", []))
+    risk_level = "HIGH" if flag_count >= 3 else "MEDIUM" if flag_count >= 1 else "LOW"
+    notes_collection.upsert(
+        ids=[f"patient_{patient_id}"],
+        embeddings=[embedder.encode(note).tolist()],
+        documents=[note],
+        metadatas=[{
+            "patient_id":        patient_id,
+            "primary_diagnosis": summary.get("primary_diagnosis", ""),
+            "risk_level":        risk_level,
+            "url":               "manual_entry",
+            "chunk":             0
+        }]
+    )
+
+    return render_template_string(TEMPLATE, **base_context(
+        summary=summary, note_text=note, patient_id=patient_id
+    ))
+
+
+@app.route("/caregaps", methods=["POST"])
+def caregaps():
+    note        = request.form.get("clinical_note", "").strip()
+    temperature = float(request.form.get("temperature", 0.0))
+    max_tokens  = int(request.form.get("max_tokens", 1500))
+
+    if not note:
+        return render_template_string(TEMPLATE, **base_context())
+
+    relevant_guidelines = retrieve_relevant_guidelines(note, k=12)
+    guidelines_text     = "\n".join([f"- {g}" for g in relevant_guidelines])
+
+    system_prompt = """You are a clinical quality specialist reviewing patient records
+against evidence-based clinical guidelines.
+Always respond with valid JSON only — no markdown, no explanation."""
+
+    user_prompt = f"""
+Review this patient's clinical note against the provided guidelines.
+Identify any care gaps — things that SHOULD have been done but are missing or overdue.
+
+Return JSON in this exact format:
+{{
+  "gaps": [
+    {{
+      "gap": "short name of the gap",
+      "guideline": "the specific guideline being violated",
+      "recommendation": "what should be done",
+      "priority": "HIGH or MEDIUM or LOW"
+    }}
+  ],
+  "summary": "one sentence overall assessment of this patient's care quality"
+}}
+
+Only flag genuine gaps — things clearly missing based on the note.
+If the note mentions something was already done, do NOT flag it as a gap.
+
+CLINICAL GUIDELINES:
+{guidelines_text}
+
+PATIENT NOTE:
+{note}
+"""
+
+    raw = get_claude_response(system_prompt, user_prompt,
+                              max_tokens=max_tokens, temperature=temperature)
+    raw = clean_json(raw)
+
+    try:
+        gaps = json.loads(raw)
+    except Exception:
+        return f"<h3>Parsing failed:</h3><pre>{raw}</pre>"
+
+    ##return render_template_string(TEMPLATE, **base_context(gaps=gaps, note_text=note))
+    return render_template_string(TEMPLATE, **base_context(gaps=gaps, note_text=note, active_tab="gaps"))
+
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    raw_urls       = request.form.get("urls", "").strip()
+    urls           = [u.strip() for u in raw_urls.splitlines() if u.strip()]
+    auto_summarize = request.form.get("auto_summarize") == "on"
+
+    if not urls:
+        return render_template_string(TEMPLATE, **base_context(active_tab="ingest"))
+
+    # ── Async scraping — all URLs at once ──
+    scraped = asyncio.run(scrape_urls_async(urls))
+
+    ingest_results = []
+    for url, text, error in scraped:
+        if text:
+            # Always index in ChromaDB
+            chunks_added = index_note(url, text)
+            result = {
+                "url":        url,
+                "success":    True,
+                "chunks":     chunks_added,
+                "patient_id": None,
+                "error":      None
+            }
+
+            # Auto-summarize — only if checkbox ticked
+            if auto_summarize:
+                try:
+                    system_prompt = """You are a clinical documentation specialist.
+Extract structured information from the clinical note provided.
+Always respond with valid JSON only — no markdown, no explanation."""
+
+                    user_prompt = f"""Extract the following from this clinical note and return as JSON:
+{{
+  "primary_diagnosis": "main diagnosis as a string",
+  "comorbidities": ["list of other conditions"],
+  "medications": ["list of current medications with doses if mentioned"],
+  "key_findings": ["list of important clinical findings, lab values, vitals"],
+  "risk_flags": ["list of urgent concerns that need immediate attention"],
+  "follow_up_actions": ["list of recommended follow-up actions"]
+}}
+Clinical Note:
+{text[:3000]}"""
+
+                    raw       = get_claude_response(system_prompt, user_prompt)
+                    raw       = clean_json(raw)
+                    summary   = json.loads(raw)
+                    patient_id = save_patient(summary, text)
+
+                    # Save to ChromaDB with patient_id linked
+                    flag_count = len(summary.get("risk_flags", []))
+                    risk_level = "HIGH" if flag_count >= 3 else "MEDIUM" if flag_count >= 1 else "LOW"
+                    notes_collection.upsert(
+                        ids=[f"patient_{patient_id}"],
+                        embeddings=[embedder.encode(text[:1000]).tolist()],
+                        documents=[text[:1000]],
+                        metadatas=[{
+                            "patient_id":        patient_id,
+                            "primary_diagnosis": summary.get("primary_diagnosis", ""),
+                            "risk_level":        risk_level,
+                            "url":               url,
+                            "chunk":             0
+                        }]
+                    )
+                    result["patient_id"] = patient_id
+
+                except Exception as e:
+                    result["error"] = f"Summarize failed: {str(e)}"
+
+            ingest_results.append(result)
+
+        else:
+            ingest_results.append({
+                "url":        url,
+                "success":    False,
+                "chunks":     0,
+                "patient_id": None,
+                "error":      error
+            })
+
+    return render_template_string(TEMPLATE, **base_context(
+        ingest_results=ingest_results,
+        active_tab="ingest"
+    ))
+
+
+@app.route("/search", methods=["POST"])
+def search():
+    query = request.form.get("query", "").strip()
+    if not query:
+        return render_template_string(TEMPLATE, **base_context(
+            search_query=query, search_results=[]
+        ))
+    results = search_notes(query, top_k=5)
+    return render_template_string(TEMPLATE, **base_context(search_results=results, search_query=query, active_tab="search"))
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    question = request.form.get("question", "").strip()
+    if not question:
+        return render_template_string(TEMPLATE, **base_context(
+            active_tab="ask"
+        ))
+
+    # Step 1 — retrieve relevant chunks
+    results = search_notes(question, top_k=6)
+    if not results:
+        return render_template_string(TEMPLATE, **base_context(
+            active_tab="ask",
+            ask_question=question,
+            ask_answer="No relevant notes found. Please ingest more clinical notes first.",
+            ask_sources=[]
+        ))
+
+    # Step 2 — build context from retrieved chunks
+    context_blocks = []
+    sources = []
+    for i, (doc, meta) in enumerate(results):
+        context_blocks.append(f"[Source {i+1}]\n{doc}")
+        sources.append(meta.get("url", "manual_entry"))
+
+    context = "\n\n---\n\n".join(context_blocks)
+
+    # Step 3 — ask Claude to synthesize
+    system_prompt = """You are a clinical AI assistant helping healthcare professionals 
+query and understand patient records.
+
+You will be given several clinical note excerpts as context, followed by a question.
+Answer the question based ONLY on the provided context.
+Always cite which sources you used (Source 1, Source 2 etc.).
+If the answer is not in the context, say so clearly — do not hallucinate.
+Be concise but clinically precise."""
+
+    user_prompt = f"""CLINICAL NOTES CONTEXT:
+{context}
+
+QUESTION: {question}
+
+Answer based only on the above context. Cite your sources."""
+
+    answer = get_claude_response(system_prompt, user_prompt, max_tokens=1500, temperature=0.0)
+
+    return render_template_string(TEMPLATE, **base_context(
+        active_tab="ask",
+        ask_question=question,
+        ask_answer=answer,
+        ask_sources=list(zip(range(1, len(sources)+1), sources)),
+        ask_chunks=results
+    ))
+
+@app.route("/patients")
+def patients():
+    risk_filter  = request.args.get("risk", None)
+    patient_list = get_patients_by_risk(risk_filter) if risk_filter else get_all_patients()
+    return render_template_string(TEMPLATE, **base_context(patients=patient_list, active_tab="patients"))
+
+
+@app.route("/patient/<patient_id>")
+def patient_detail(patient_id):
+    patient = get_patient_by_id(patient_id)
+    if not patient:
+        return "<h3>Patient not found</h3>"
+    for field in ["comorbidities", "medications", "key_findings",
+                  "risk_flags", "follow_up_actions"]:
+        try:
+            patient[field] = json.loads(patient[field])
+        except Exception:
+            patient[field] = []
+    return render_template_string(PATIENT_DETAIL_TEMPLATE, patient=patient)
+
+
+# ─────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    app.run(debug=True, port=5001)
