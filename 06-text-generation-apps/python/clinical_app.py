@@ -15,11 +15,22 @@ from dotenv import load_dotenv
 import asyncio
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from pydantic import BaseModel, validator
+from typing import List, Optional
 
 # ─────────────────────────────────────────────
 # INITIALISE
 # ─────────────────────────────────────────────
 load_dotenv()
+
+# ─────────────────────────────────────────────
+# DATA DIRECTORY — separate from code
+# ─────────────────────────────────────────────
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_BASE_DIR, "..", "..", "data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(_DATA_DIR, "patients.db")
 
 claude   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -31,63 +42,155 @@ notes_collection = chroma_client.get_or_create_collection("clinical_notes")
 app = Flask(__name__)
 app.jinja_env.filters["fromjson"] = json.loads
 
+
+# ─────────────────────────────────────────────
+# PYDANTIC MODELS — validate Claude's output
+# before it reaches the database
+# ─────────────────────────────────────────────
+
+class ClinicalSummary(BaseModel):
+    out_of_scope:      bool          = False
+    reason:            Optional[str] = None
+    primary_diagnosis: str           = ""
+    procedure:         Optional[str] = ""
+    comorbidities:     List[str]     = []
+    medications:       List[str]     = []
+    key_findings:      List[str]     = []
+    risk_flags:        List[str]     = []
+    follow_up_actions: List[str]     = []
+
+    @validator("medications", pre=True)
+    def medications_must_be_list(cls, v):
+        if isinstance(v, str):
+            return [m.strip() for m in v.split(",") if m.strip()]
+        return v
+
+    @validator("comorbidities", "risk_flags", "key_findings",
+               "follow_up_actions", pre=True)
+    def lists_must_be_lists(cls, v):
+        if isinstance(v, str):
+            return [v] if v else []
+        return v
+
+    @validator("medications", each_item=True)
+    def no_surgical_supplies(cls, v):
+        surgical_keywords = [
+            "monocryl", "nylon", "suture", "xylocaine", "lidocaine",
+            "epinephrine", "silk", "vicryl", "prolene", "staple",
+            "betadine", "chlorhexidine"
+        ]
+        for keyword in surgical_keywords:
+            if keyword in v.lower():
+                raise ValueError(f"Surgical supply in medications: {v}")
+        return v
+
+    @validator("comorbidities", each_item=True)
+    def no_symptoms_as_comorbidities(cls, v):
+        symptom_keywords = [
+            "fatigue", "blurred vision", "nocturia", "polyuria",
+            "polydipsia", "hemoptysis", "syncope", "dizziness",
+            "shortness of breath", "chest pain", "nausea"
+        ]
+        for keyword in symptom_keywords:
+            if keyword in v.lower():
+                raise ValueError(f"Symptom in comorbidities: {v}")
+        return v
+
+
+class CareGap(BaseModel):
+    gap:            str
+    guideline:      str
+    recommendation: str
+    priority:       str = "MEDIUM"
+
+    @validator("priority")
+    def priority_must_be_valid(cls, v):
+        if v.upper() not in {"HIGH", "MEDIUM", "LOW"}:
+            return "MEDIUM"
+        return v.upper()
+
+
+class CareGapResult(BaseModel):
+    gaps:    List[CareGap] = []
+    summary: str           = ""
+
 # ─────────────────────────────────────────────
 # CLINICAL GUIDELINES KNOWLEDGE BASE
 # ─────────────────────────────────────────────
 GUIDELINES = [
-    # DIABETES
-    "Diabetes: HbA1c should be measured every 3 months if uncontrolled (>8%), every 6 months if stable.",
-    "Diabetes: Annual diabetic eye exam (fundoscopy/retinal screening) is required for all diabetic patients.",
-    "Diabetes: Annual diabetic foot exam including monofilament sensation test is required.",
-    "Diabetes: Urine microalbumin/creatinine ratio should be checked annually to screen for nephropathy.",
-    "Diabetes: Blood pressure target for diabetic patients is <130/80 mmHg.",
-    "Diabetes: Statin therapy is recommended for all diabetic patients aged 40-75.",
-    "Diabetes: ACE inhibitor or ARB is recommended if microalbuminuria is present.",
-    "Diabetes: Referral to endocrinology if HbA1c remains >9% despite treatment.",
-    "Diabetes: Diabetes self-management education program enrollment is recommended at diagnosis.",
-    "Diabetes: Annual flu vaccination is recommended for all diabetic patients.",
-    # CONGESTIVE HEART FAILURE
-    "Heart Failure: ACE inhibitor or ARB therapy is recommended for all HFrEF patients (EF <40%).",
-    "Heart Failure: Beta-blocker therapy is recommended for all stable HFrEF patients.",
-    "Heart Failure: Aldosterone antagonist recommended for HFrEF patients with EF <35%.",
-    "Heart Failure: BNP or NT-proBNP should be measured to assess disease severity.",
-    "Heart Failure: Echocardiogram recommended to assess ejection fraction at diagnosis and after treatment changes.",
-    "Heart Failure: Daily weight monitoring and fluid restriction education is required.",
-    "Heart Failure: Cardiology referral is recommended for newly diagnosed heart failure.",
-    "Heart Failure: Annual flu and pneumococcal vaccination recommended for heart failure patients.",
-    "Heart Failure: Sodium restriction to <2g/day is recommended.",
-    "Heart Failure: 30-day readmission follow-up appointment is required post-discharge.",
-    # HYPERTENSION
-    "Hypertension: Blood pressure target is <130/80 mmHg for most patients per ACC/AHA guidelines.",
-    "Hypertension: First-line agents include thiazide diuretics, CCBs, ACE inhibitors, or ARBs.",
-    "Hypertension: Annual renal function (eGFR, creatinine) and electrolyte monitoring required.",
-    "Hypertension: Lifestyle modifications including DASH diet and exercise counseling are required.",
-    "Hypertension: EKG recommended to assess for LVH in newly diagnosed hypertensive patients.",
-    # CHRONIC KIDNEY DISEASE
-    "CKD: eGFR and urine albumin-creatinine ratio should be monitored every 3-6 months.",
-    "CKD: Blood pressure target for CKD patients is <130/80 mmHg.",
-    "CKD: ACE inhibitor or ARB recommended for CKD patients with proteinuria.",
-    "CKD: Nephrology referral recommended when eGFR falls below 30 mL/min.",
-    "CKD: Anemia workup (CBC, iron studies) recommended for CKD patients.",
-    "CKD: Dietary protein restriction and phosphate management counseling recommended.",
-    "CKD: Avoid NSAIDs and nephrotoxic medications in CKD patients.",
-    "CKD: Vaccination: Hepatitis B, flu, and pneumococcal vaccines recommended.",
-    # ASTHMA
-    "Asthma: Annual spirometry/pulmonary function test recommended to assess control.",
-    "Asthma: Inhaled corticosteroid is first-line controller therapy for persistent asthma.",
-    "Asthma: Asthma action plan should be documented and provided to patient.",
-    "Asthma: Referral to pulmonology if symptoms uncontrolled on moderate-dose ICS.",
-    # DYSLIPIDAEMIA
-    "Dyslipidaemia: Fasting lipid panel should be checked annually.",
-    "Dyslipidaemia: Statin therapy recommended for patients with cardiovascular risk >10% (10-year ASCVD risk).",
-    "Dyslipidaemia: LDL target <70 mg/dL for very high cardiovascular risk patients.",
-    "Dyslipidaemia: Lifestyle counseling on diet and exercise is required alongside pharmacotherapy.",
+    # ── DIABETES ──────────────────────────────
+    {"condition": "diabetes", "text": "Diabetes: HbA1c should be measured every 3 months if uncontrolled (>8%), every 6 months if stable."},
+    {"condition": "diabetes", "text": "Diabetes: Annual diabetic eye exam (fundoscopy/retinal screening) is required for all diabetic patients."},
+    {"condition": "diabetes", "text": "Diabetes: Annual diabetic foot exam including monofilament sensation test is required."},
+    {"condition": "diabetes", "text": "Diabetes: Urine microalbumin/creatinine ratio should be checked annually to screen for nephropathy."},
+    {"condition": "diabetes", "text": "Diabetes: Blood pressure target for diabetic patients is <130/80 mmHg."},
+    {"condition": "diabetes", "text": "Diabetes: Statin therapy is recommended for all diabetic patients aged 40-75."},
+    {"condition": "diabetes", "text": "Diabetes: ACE inhibitor or ARB is recommended if microalbuminuria is present."},
+    {"condition": "diabetes", "text": "Diabetes: Referral to endocrinology if HbA1c remains >9% despite treatment."},
+    {"condition": "diabetes", "text": "Diabetes: Diabetes self-management education program enrollment is recommended at diagnosis."},
+    {"condition": "diabetes", "text": "Diabetes: Annual flu vaccination is recommended for all diabetic patients."},
+    {"condition": "diabetes", "text": "Diabetes: Pneumococcal vaccination recommended for all diabetic patients."},
+
+    # ── HEART FAILURE ──────────────────────────
+    {"condition": "heart_failure", "text": "Heart Failure: ACE inhibitor or ARB therapy is recommended for all HFrEF patients (EF <40%)."},
+    {"condition": "heart_failure", "text": "Heart Failure: Beta-blocker therapy is recommended for all stable HFrEF patients."},
+    {"condition": "heart_failure", "text": "Heart Failure: Aldosterone antagonist recommended for HFrEF patients with EF <35%."},
+    {"condition": "heart_failure", "text": "Heart Failure: BNP or NT-proBNP should be measured to assess disease severity."},
+    {"condition": "heart_failure", "text": "Heart Failure: Echocardiogram recommended to assess ejection fraction at diagnosis and after treatment changes."},
+    {"condition": "heart_failure", "text": "Heart Failure: Daily weight monitoring and fluid restriction education is required."},
+    {"condition": "heart_failure", "text": "Heart Failure: Cardiology referral is recommended for newly diagnosed heart failure."},
+    {"condition": "heart_failure", "text": "Heart Failure: Annual flu and pneumococcal vaccination recommended for heart failure patients."},
+    {"condition": "heart_failure", "text": "Heart Failure: Sodium restriction to <2g/day is recommended."},
+    {"condition": "heart_failure", "text": "Heart Failure: 30-day readmission follow-up appointment is required post-discharge."},
+
+    # ── HYPERTENSION ──────────────────────────
+    {"condition": "hypertension", "text": "Hypertension: Blood pressure target is <130/80 mmHg for most patients per ACC/AHA guidelines."},
+    {"condition": "hypertension", "text": "Hypertension: If blood pressure is above target despite medication, intensify antihypertensive therapy or add a second agent."},
+    {"condition": "hypertension", "text": "Hypertension: First-line agents include thiazide diuretics, CCBs, ACE inhibitors, or ARBs."},
+    {"condition": "hypertension", "text": "Hypertension: Annual renal function (eGFR, creatinine) and electrolyte monitoring required."},
+    {"condition": "hypertension", "text": "Hypertension: Lifestyle modifications including DASH diet and exercise counseling are required."},
+    {"condition": "hypertension", "text": "Hypertension: EKG recommended to assess for LVH in newly diagnosed hypertensive patients."},
+    {"condition": "hypertension", "text": "Hypertension: Cardiovascular risk assessment (10-year ASCVD risk) should be calculated and documented."},
+
+    # ── CKD ───────────────────────────────────
+    {"condition": "ckd", "text": "CKD: eGFR and urine albumin-creatinine ratio should be monitored every 3-6 months."},
+    {"condition": "ckd", "text": "CKD: Blood pressure target for CKD patients is <130/80 mmHg."},
+    {"condition": "ckd", "text": "CKD: ACE inhibitor or ARB recommended for CKD patients with proteinuria."},
+    {"condition": "ckd", "text": "CKD: Nephrology referral recommended when eGFR falls below 30 mL/min."},
+    {"condition": "ckd", "text": "CKD: Anemia workup (CBC, iron studies, ESA consideration) recommended for CKD patients."},
+    {"condition": "ckd", "text": "CKD: Dietary protein restriction and phosphate management counseling recommended."},
+    {"condition": "ckd", "text": "CKD: Avoid NSAIDs, aminoglycosides, and nephrotoxic contrast agents — document counseling."},
+    {"condition": "ckd", "text": "CKD: Secondary hyperparathyroidism — monitor PTH every 3-6 months in stage III-V CKD."},
+    {"condition": "ckd", "text": "CKD: Hepatitis B vaccination recommended for all CKD patients not yet immune."},
+    {"condition": "ckd", "text": "CKD: Flu and pneumococcal vaccination recommended for all CKD patients."},
+
+    # ── ASTHMA ────────────────────────────────
+    {"condition": "asthma", "text": "Asthma: Annual spirometry/pulmonary function test recommended to assess control."},
+    {"condition": "asthma", "text": "Asthma: Inhaled corticosteroid is first-line controller therapy for persistent asthma."},
+    {"condition": "asthma", "text": "Asthma: Asthma action plan should be documented and provided to patient."},
+    {"condition": "asthma", "text": "Asthma: Referral to pulmonology if symptoms uncontrolled on moderate-dose ICS."},
+
+    # ── DYSLIPIDAEMIA ─────────────────────────
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: Fasting lipid panel should be checked annually."},
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: Statin therapy recommended for patients with cardiovascular risk >10% (10-year ASCVD risk)."},
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: LDL target <70 mg/dL for very high cardiovascular risk patients."},
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: Lifestyle counseling on diet and exercise is required alongside pharmacotherapy."},
+
+    # ── GENERAL / PREVENTIVE ──────────────────
+    {"condition": "general", "text": "General: Smoking cessation counseling and pharmacotherapy is strongly recommended for all active smokers at every clinical encounter."},
+    {"condition": "general", "text": "General: Annual influenza vaccination recommended for all patients with chronic conditions."},
+    {"condition": "general", "text": "General: Pneumococcal vaccination (PCV15/PPSV23) recommended for immunocompromised patients and those with chronic disease."},
+    {"condition": "general", "text": "General: BMI should be documented and obesity management counseling provided if BMI >30."},
 ]
+
+# Separate texts and condition tags for retrieval
+GUIDELINE_TEXTS      = [g["text"] for g in GUIDELINES]
+GUIDELINE_CONDITIONS = [g["condition"] for g in GUIDELINES]
 
 # Embed guidelines at startup
 print("Embedding clinical guidelines knowledge base...")
 guideline_embeddings = np.array(
-    [embedder.encode(g) for g in GUIDELINES], dtype="float32"
+    [embedder.encode(g) for g in GUIDELINE_TEXTS], dtype="float32"
 )
 guideline_index = faiss.IndexFlatL2(guideline_embeddings.shape[1])
 guideline_index.add(guideline_embeddings)
@@ -98,7 +201,7 @@ print(f"✅ {len(GUIDELINES)} guidelines embedded and indexed.")
 # SQLITE — Structured patient data store
 # Replace connection with BigQuery in Phase 3
 # ─────────────────────────────────────────────
-DB_PATH = "./patients.db"
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -107,6 +210,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS patients (
             patient_id        TEXT PRIMARY KEY,
             primary_diagnosis TEXT,
+            procedure         TEXT,
             comorbidities     TEXT,
             medications       TEXT,
             key_findings      TEXT,
@@ -129,13 +233,14 @@ def save_patient(summary, source_note):
     c    = conn.cursor()
     c.execute("""
         INSERT INTO patients (
-            patient_id, primary_diagnosis, comorbidities,
+            patient_id, primary_diagnosis, procedure,comorbidities,
             medications, key_findings, risk_flags,
             follow_up_actions, risk_level, source_note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?,?, ?, ?, ?, ?, ?, ?)
     """, (
         patient_id,
         summary.get("primary_diagnosis", ""),
+        summary.get("procedure", ""),
         json.dumps(summary.get("comorbidities", [])),
         json.dumps(summary.get("medications", [])),
         json.dumps(summary.get("key_findings", [])),
@@ -153,7 +258,7 @@ def get_all_patients():
     conn.row_factory = sqlite3.Row
     c    = conn.cursor()
     c.execute("""
-        SELECT patient_id, primary_diagnosis, comorbidities,
+        SELECT patient_id, primary_diagnosis, procedure,comorbidities,
                medications, risk_flags, risk_level, created_at
         FROM patients ORDER BY created_at DESC
     """)
@@ -175,7 +280,7 @@ def get_patients_by_risk(risk_level):
     conn.row_factory = sqlite3.Row
     c    = conn.cursor()
     c.execute("""
-        SELECT patient_id, primary_diagnosis, risk_flags,
+        SELECT patient_id, primary_diagnosis, procedure,risk_flags,
                risk_level, created_at
         FROM patients WHERE risk_level = ?
         ORDER BY created_at DESC
@@ -241,10 +346,68 @@ def chunk_text(text, chunk_size=512):
         for i in range(0, len(words), approx_words)
     ]
 
-def retrieve_relevant_guidelines(query, k=10):
+# Maps clinical keywords to condition categories
+CONDITION_MAP = {
+    "diabetes":           "diabetes",
+    "diabetic":           "diabetes",
+    "hyperglycemia":      "diabetes",
+    "hba1c":              "diabetes",
+    "heart failure":      "heart_failure",
+    "chf":                "heart_failure",
+    "cardiomyopathy":     "heart_failure",
+    "hfref":              "heart_failure",
+    "hypertension":       "hypertension",
+    "high blood pressure":"hypertension",
+    "ckd":                "ckd",
+    "chronic kidney":     "ckd",
+    "renal insufficiency":"ckd",
+    "nephropathy":        "ckd",
+    "kidney disease":     "ckd",
+    "asthma":             "asthma",
+    "dyslipidemia":       "dyslipidaemia",
+    "dyslipidaemia":      "dyslipidaemia",
+    "hyperlipidemia":     "dyslipidaemia",
+    "cholesterol":        "dyslipidaemia",
+}
+
+def detect_conditions(summary):
+    """Detect which condition categories apply to this patient"""
+    detected = set(["general"])  # always include general guidelines
+    search_text = summary.get("primary_diagnosis", "").lower()
+    for c in summary.get("comorbidities", []):
+        search_text += " " + c.lower()
+    for keyword, tag in CONDITION_MAP.items():
+        if keyword in search_text:
+            detected.add(tag)
+    return detected
+
+def retrieve_relevant_guidelines(query, summary=None, k=12):
+    """
+    If summary provided, filter guidelines by patient's actual conditions.
+    Prevents CHF guidelines firing on hypertension-only patients.
+    """
     query_vec = np.array([embedder.encode(query)], dtype="float32")
-    D, I      = guideline_index.search(query_vec, k=k)
-    return [GUIDELINES[i] for i in I[0]]
+    D, I = guideline_index.search(query_vec, k=min(k*2, len(GUIDELINES)))
+
+    if summary:
+        detected_conditions = detect_conditions(summary)
+        filtered = []
+        for idx in I[0]:
+            guideline_condition = GUIDELINE_CONDITIONS[idx]
+            if guideline_condition in detected_conditions:
+                filtered.append(GUIDELINE_TEXTS[idx])
+            if len(filtered) >= k:
+                break
+        # If too few, pad with unfiltered
+        if len(filtered) < 3:
+            for idx in I[0]:
+                if GUIDELINE_TEXTS[idx] not in filtered:
+                    filtered.append(GUIDELINE_TEXTS[idx])
+                if len(filtered) >= k:
+                    break
+        return filtered
+    else:
+        return [GUIDELINE_TEXTS[i] for i in I[0][:k]]
 
 def scrape_url_content(url):
     try:
@@ -378,10 +541,11 @@ def base_context(**kwargs):
         patients=None,
         stats=stats,
         active_tab="summarize",
-        ask_question=None,      # ← add these
+        ask_question=None,
         ask_answer=None,
         ask_sources=None,
-        ask_chunks=None
+        ask_chunks=None,
+        out_of_scope_reason=None    # ← new
     )
     defaults.update(kwargs)
     return defaults
@@ -774,7 +938,7 @@ TEMPLATE = """
       <table>
         <thead>
           <tr>
-            <th>Patient ID</th><th>Primary Diagnosis</th><th>Risk Flags</th>
+            <th>Patient ID</th><th>Primary Diagnosis</th><th>Procedure</th><th>Risk Flags</th>
             <th>Risk Level</th><th>Added</th><th>Action</th>
           </tr>
         </thead>
@@ -783,6 +947,7 @@ TEMPLATE = """
           <tr>
             <td style="font-weight:600; color:#2b6cb0;">{{ p.patient_id }}</td>
             <td>{{ p.primary_diagnosis[:50] }}{% if p.primary_diagnosis|length > 50 %}...{% endif %}</td>
+            <td style="color:#718096; font-size:12px;">{{ p.procedure or '—' }}</td>
             <td>
               {% set flags = p.risk_flags | fromjson %}
               {% for f in flags[:2] %}<span class="tag tag-high" style="font-size:10px;">{{ f[:25] }}</span>{% endfor %}
@@ -807,7 +972,16 @@ TEMPLATE = """
     {% endif %}
   </div>
 
-  <!-- ── SUMMARY RESULTS ────────────────────────────────────── -->
+  <!-- OUT OF SCOPE BANNER -->
+  {% if out_of_scope_reason %}
+  <div style="background:#fffff0; border:1px solid #f6e05e; border-radius:8px; padding:16px; margin-top:20px;">
+    <b>⚠️ Out of Scope Note</b> — {{ out_of_scope_reason }}<br>
+    <span style="font-size:13px; color:#718096; margin-top:6px; display:block;">
+      No patient record was created. Supported: Diabetes, Hypertension, Heart Failure, CKD, Asthma, Dyslipidaemia.
+    </span>
+  </div>
+  {% endif %}
+
   {% if summary %}
   {% if patient_id %}
   <div class="saved-banner">
@@ -904,14 +1078,48 @@ Extract structured information from the clinical note provided.
 Always respond with valid JSON only — no markdown, no explanation."""
 
     user_prompt = f"""
-Extract the following from this clinical note and return as JSON:
+First determine if this note is IN SCOPE for chronic disease management.
+
+IN SCOPE: diabetes, hypertension, heart failure, CKD, asthma, dyslipidaemia,
+general medicine chronic disease follow-up, endocrinology, nephrology, cardiology
+for chronic conditions.
+
+OUT OF SCOPE: surgical procedure notes (excisions, biopsies, repairs),
+dermatology procedures, orthopaedic procedures, acute one-time procedures,
+anaesthesia notes, operative reports for non-chronic conditions.
+
+If OUT OF SCOPE return exactly:
+{{"out_of_scope": true, "reason": "brief explanation of why this note is out of scope"}}
+
+If IN SCOPE extract and return this JSON:
 {{
-  "primary_diagnosis": "main diagnosis as a string",
-  "comorbidities": ["list", "of", "other", "conditions"],
-  "medications": ["list of current medications with doses if mentioned"],
-  "key_findings": ["list of important clinical findings, lab values, vitals"],
-  "risk_flags": ["list of urgent concerns that need immediate attention"],
-  "follow_up_actions": ["list of recommended follow-up actions mentioned or implied"]
+  "out_of_scope": false,
+  "primary_diagnosis": "specific diagnosis with severity/stage if mentioned",
+  "procedure": "name of any procedure performed in this encounter, or empty string if none",
+  "comorbidities": [
+    "list diagnosed medical conditions only",
+    "do NOT include symptoms like fatigue or blurred vision",
+    "do NOT include family history"
+  ],
+  "medications": [
+    "list each medication individually with dose and frequency",
+    "ONLY include ongoing medications the patient takes at home",
+    "do NOT include anaesthetics, suture materials, IV fluids, or surgical supplies"
+  ],
+  "key_findings": [
+    "lab values with numbers (HbA1c, eGFR, BNP, creatinine, lipids)",
+    "abnormal vital signs",
+    "examination findings relevant to chronic disease"
+  ],
+  "risk_flags": [
+    "urgent concerns requiring immediate clinical attention",
+    "uncontrolled values significantly above target",
+    "missing critical medications for the diagnosed condition"
+  ],
+  "follow_up_actions": [
+    "specific recommended next steps from the note",
+    "referrals mentioned or implied"
+  ]
 }}
 
 Clinical Note:
@@ -923,15 +1131,34 @@ Clinical Note:
     raw = clean_json(raw)
 
     try:
-        summary = json.loads(raw)
-    except Exception:
-        return f"<h3>Parsing failed:</h3><pre>{raw}</pre>"
+        raw_dict = json.loads(raw)
+        summary  = ClinicalSummary(**raw_dict)
+    except json.JSONDecodeError:
+        return f"<h3>JSON parsing failed:</h3><pre>{raw}</pre>"
+    except Exception as e:
+        print(f"Pydantic validation error: {e}")
+        # Try to salvage without problematic fields
+        try:
+            raw_dict = json.loads(raw)
+            raw_dict["medications"]   = []
+            raw_dict["comorbidities"] = []
+            summary = ClinicalSummary(**raw_dict)
+        except Exception:
+            return f"<h3>Validation failed:</h3><pre>{str(e)}</pre>"
 
-    # Save to SQLite — structured layer
-    patient_id = save_patient(summary, note)
+    # Handle out of scope
+    if summary.out_of_scope:
+        return render_template_string(TEMPLATE, **base_context(
+            active_tab="summarize",
+            note_text=note,
+            out_of_scope_reason=summary.reason or "Outside supported disease programmes."
+        ))
+
+    # Save to SQLite — convert Pydantic model to dict first
+    patient_id = save_patient(summary.dict(), note)
 
     # Save to ChromaDB — vector layer, linked to patient_id
-    flag_count = len(summary.get("risk_flags", []))
+    flag_count = len(summary.risk_flags)
     risk_level = "HIGH" if flag_count >= 3 else "MEDIUM" if flag_count >= 1 else "LOW"
     notes_collection.upsert(
         ids=[f"patient_{patient_id}"],
@@ -939,7 +1166,7 @@ Clinical Note:
         documents=[note],
         metadatas=[{
             "patient_id":        patient_id,
-            "primary_diagnosis": summary.get("primary_diagnosis", ""),
+            "primary_diagnosis": summary.primary_diagnosis,
             "risk_level":        risk_level,
             "url":               "manual_entry",
             "chunk":             0
@@ -960,7 +1187,21 @@ def caregaps():
     if not note:
         return render_template_string(TEMPLATE, **base_context())
 
-    relevant_guidelines = retrieve_relevant_guidelines(note, k=12)
+    # Quick lightweight extraction to detect patient conditions
+    try:
+        quick_raw = get_claude_response(
+            "Return only valid JSON, no explanation.",
+            f"""Extract just diagnosis and comorbidities as JSON:
+{{"primary_diagnosis": "...", "comorbidities": ["..."]}}
+Note: {note[:1000]}""",
+            max_tokens=300, temperature=0.0
+        )
+        quick_summary = json.loads(clean_json(quick_raw))
+    except Exception:
+        quick_summary = {"primary_diagnosis": note[:200], "comorbidities": []}
+
+    # Retrieve guidelines filtered to patient's actual conditions
+    relevant_guidelines = retrieve_relevant_guidelines(note, summary=quick_summary, k=12)
     guidelines_text     = "\n".join([f"- {g}" for g in relevant_guidelines])
 
     system_prompt = """You are a clinical quality specialist reviewing patient records
@@ -986,6 +1227,9 @@ Return JSON in this exact format:
 
 Only flag genuine gaps — things clearly missing based on the note.
 If the note mentions something was already done, do NOT flag it as a gap.
+Only flag heart failure guidelines if heart failure is a documented diagnosis.
+Only flag CKD guidelines if CKD or renal disease is a documented diagnosis.
+Do not apply guidelines from conditions the patient does not have.
 
 CLINICAL GUIDELINES:
 {guidelines_text}
@@ -999,9 +1243,14 @@ PATIENT NOTE:
     raw = clean_json(raw)
 
     try:
-        gaps = json.loads(raw)
-    except Exception:
-        return f"<h3>Parsing failed:</h3><pre>{raw}</pre>"
+        raw_dict   = json.loads(raw)
+        gap_result = CareGapResult(**raw_dict)
+        gaps       = gap_result.dict()
+    except json.JSONDecodeError:
+        return f"<h3>JSON parsing failed:</h3><pre>{raw}</pre>"
+    except Exception as e:
+        print(f"Care gap validation error: {e}")
+        gaps = {"gaps": [], "summary": "Validation error — could not parse care gaps."}
 
     ##return render_template_string(TEMPLATE, **base_context(gaps=gaps, note_text=note))
     return render_template_string(TEMPLATE, **base_context(gaps=gaps, note_text=note, active_tab="gaps"))

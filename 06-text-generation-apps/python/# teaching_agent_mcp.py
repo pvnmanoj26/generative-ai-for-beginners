@@ -71,7 +71,11 @@ def generate_quiz():
 
     # Generate quiz
     prompt = f"Create a {num_q}-question MCQ quiz from:\n{text[:2000]}"
-    response = genai.GenerativeModel("gemini-pro").generate_content(prompt)
+    #response = genai.GenerativeModel("gemini-pro").generate_content(prompt)
+    response = genai.GenerativeModel(
+    "models/gemini-1.5-pro"
+).generate_content(prompt)
+
 
     return jsonify({"quiz": response.text})
 
@@ -112,7 +116,11 @@ def agent():
     }}
     """
 
-    decision = genai.GenerativeModel("gemini-pro").generate_content(tool_prompt).text
+    #decision = genai.GenerativeModel("gemini-pro").generate_content(tool_prompt).text
+    decision = genai.GenerativeModel(
+    "models/gemini-1.5-flash"
+).generate_content(tool_prompt).text
+
 
     import json
     try:
