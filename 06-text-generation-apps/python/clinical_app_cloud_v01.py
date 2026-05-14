@@ -1,0 +1,1496 @@
+import os
+import json
+import re
+import uuid
+import requests
+import numpy as np
+import faiss
+#import chromadb
+from bs4 import BeautifulSoup
+from flask import Flask, request, render_template_string
+import anthropic
+# from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+from upstash_vector import Index
+from google.cloud import bigquery
+import asyncio
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from pydantic import BaseModel, validator
+from typing import List, Optional
+import vertexai
+from vertexai.language_models import TextEmbeddingModel
+
+
+# ─────────────────────────────────────────────
+# INITIALISE
+# ─────────────────────────────────────────────
+load_dotenv()
+
+# ─────────────────────────────────────────────
+# DATA DIRECTORY — separate from code
+# ─────────────────────────────────────────────
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_BASE_DIR, "..", "..", "data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+#For Local - DB_PATH = os.path.join(_DATA_DIR, "patients.db")
+# BigQuery config
+BQ_PROJECT = "healthcare-ai-manoj"
+BQ_DATASET = "healthcare_ai"
+BQ_TABLE   = f"{BQ_PROJECT}.{BQ_DATASET}.patients"
+bq_client  = bigquery.Client(project=BQ_PROJECT)
+
+claude   = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+vertexai.init(project="healthcare-ai-manoj", location="us-central1")
+embedder = TextEmbeddingModel.from_pretrained("text-embedding-004")
+
+def get_embedding(text):
+    """Get embedding vector — Vertex AI text-embedding-004"""
+    result = embedder.get_embeddings([text[:3000]])
+    return result[0].values
+
+# Persistent ChromaDB — survives restarts
+# chroma_client = chromadb.PersistentClient(path=os.path.join(_DATA_DIR, "chroma_db"))
+# notes_collection = chroma_client.get_or_create_collection("clinical_notes")
+
+#Upstash - serverless
+notes_collection = Index(
+    url=os.getenv("UPSTASH_VECTOR_REST_URL"),
+    token=os.getenv("UPSTASH_VECTOR_REST_TOKEN")
+)
+
+app = Flask(__name__)
+app.jinja_env.filters["fromjson"] = json.loads
+
+
+# ─────────────────────────────────────────────
+# PYDANTIC MODELS — validate Claude's output
+# before it reaches the database
+# ─────────────────────────────────────────────
+
+class ClinicalSummary(BaseModel):
+    out_of_scope:      bool          = False
+    reason:            Optional[str] = None
+    primary_diagnosis: str           = ""
+    procedure:         Optional[str] = ""
+    comorbidities:     List[str]     = []
+    medications:       List[str]     = []
+    key_findings:      List[str]     = []
+    risk_flags:        List[str]     = []
+    follow_up_actions: List[str]     = []
+
+    @validator("medications", pre=True)
+    def medications_must_be_list(cls, v):
+        if isinstance(v, str):
+            return [m.strip() for m in v.split(",") if m.strip()]
+        return v
+
+    @validator("comorbidities", "risk_flags", "key_findings",
+               "follow_up_actions", pre=True)
+    def lists_must_be_lists(cls, v):
+        if isinstance(v, str):
+            return [v] if v else []
+        return v
+
+    @validator("medications", each_item=True)
+    def no_surgical_supplies(cls, v):
+        surgical_keywords = [
+            "monocryl", "nylon", "suture", "xylocaine", "lidocaine",
+            "epinephrine", "silk", "vicryl", "prolene", "staple",
+            "betadine", "chlorhexidine"
+        ]
+        for keyword in surgical_keywords:
+            if keyword in v.lower():
+                raise ValueError(f"Surgical supply in medications: {v}")
+        return v
+
+    @validator("comorbidities", each_item=True)
+    def no_symptoms_as_comorbidities(cls, v):
+        symptom_keywords = [
+            "fatigue", "blurred vision", "nocturia", "polyuria",
+            "polydipsia", "hemoptysis", "syncope", "dizziness",
+            "shortness of breath", "chest pain", "nausea"
+        ]
+        for keyword in symptom_keywords:
+            if keyword in v.lower():
+                raise ValueError(f"Symptom in comorbidities: {v}")
+        return v
+
+
+class CareGap(BaseModel):
+    gap:            str
+    guideline:      str
+    recommendation: str
+    priority:       str = "MEDIUM"
+
+    @validator("priority")
+    def priority_must_be_valid(cls, v):
+        if v.upper() not in {"HIGH", "MEDIUM", "LOW"}:
+            return "MEDIUM"
+        return v.upper()
+
+
+class CareGapResult(BaseModel):
+    gaps:    List[CareGap] = []
+    summary: str           = ""
+
+# ─────────────────────────────────────────────
+# CLINICAL GUIDELINES KNOWLEDGE BASE
+# ─────────────────────────────────────────────
+GUIDELINES = [
+    # ── DIABETES ──────────────────────────────
+    {"condition": "diabetes", "text": "Diabetes: HbA1c should be measured every 3 months if uncontrolled (>8%), every 6 months if stable."},
+    {"condition": "diabetes", "text": "Diabetes: Annual diabetic eye exam (fundoscopy/retinal screening) is required for all diabetic patients."},
+    {"condition": "diabetes", "text": "Diabetes: Annual diabetic foot exam including monofilament sensation test is required."},
+    {"condition": "diabetes", "text": "Diabetes: Urine microalbumin/creatinine ratio should be checked annually to screen for nephropathy."},
+    {"condition": "diabetes", "text": "Diabetes: Blood pressure target for diabetic patients is <130/80 mmHg."},
+    {"condition": "diabetes", "text": "Diabetes: Statin therapy is recommended for all diabetic patients aged 40-75."},
+    {"condition": "diabetes", "text": "Diabetes: ACE inhibitor or ARB is recommended if microalbuminuria is present."},
+    {"condition": "diabetes", "text": "Diabetes: Referral to endocrinology if HbA1c remains >9% despite treatment."},
+    {"condition": "diabetes", "text": "Diabetes: Diabetes self-management education program enrollment is recommended at diagnosis."},
+    {"condition": "diabetes", "text": "Diabetes: Annual flu vaccination is recommended for all diabetic patients."},
+    {"condition": "diabetes", "text": "Diabetes: Pneumococcal vaccination recommended for all diabetic patients."},
+
+    # ── HEART FAILURE ──────────────────────────
+    {"condition": "heart_failure", "text": "Heart Failure: ACE inhibitor or ARB therapy is recommended for all HFrEF patients (EF <40%)."},
+    {"condition": "heart_failure", "text": "Heart Failure: Beta-blocker therapy is recommended for all stable HFrEF patients."},
+    {"condition": "heart_failure", "text": "Heart Failure: Aldosterone antagonist recommended for HFrEF patients with EF <35%."},
+    {"condition": "heart_failure", "text": "Heart Failure: BNP or NT-proBNP should be measured to assess disease severity."},
+    {"condition": "heart_failure", "text": "Heart Failure: Echocardiogram recommended to assess ejection fraction at diagnosis and after treatment changes."},
+    {"condition": "heart_failure", "text": "Heart Failure: Daily weight monitoring and fluid restriction education is required."},
+    {"condition": "heart_failure", "text": "Heart Failure: Cardiology referral is recommended for newly diagnosed heart failure."},
+    {"condition": "heart_failure", "text": "Heart Failure: Annual flu and pneumococcal vaccination recommended for heart failure patients."},
+    {"condition": "heart_failure", "text": "Heart Failure: Sodium restriction to <2g/day is recommended."},
+    {"condition": "heart_failure", "text": "Heart Failure: 30-day readmission follow-up appointment is required post-discharge."},
+
+    # ── HYPERTENSION ──────────────────────────
+    {"condition": "hypertension", "text": "Hypertension: Blood pressure target is <130/80 mmHg for most patients per ACC/AHA guidelines."},
+    {"condition": "hypertension", "text": "Hypertension: If blood pressure is above target despite medication, intensify antihypertensive therapy or add a second agent."},
+    {"condition": "hypertension", "text": "Hypertension: First-line agents include thiazide diuretics, CCBs, ACE inhibitors, or ARBs."},
+    {"condition": "hypertension", "text": "Hypertension: Annual renal function (eGFR, creatinine) and electrolyte monitoring required."},
+    {"condition": "hypertension", "text": "Hypertension: Lifestyle modifications including DASH diet and exercise counseling are required."},
+    {"condition": "hypertension", "text": "Hypertension: EKG recommended to assess for LVH in newly diagnosed hypertensive patients."},
+    {"condition": "hypertension", "text": "Hypertension: Cardiovascular risk assessment (10-year ASCVD risk) should be calculated and documented."},
+
+    # ── CKD ───────────────────────────────────
+    {"condition": "ckd", "text": "CKD: eGFR and urine albumin-creatinine ratio should be monitored every 3-6 months."},
+    {"condition": "ckd", "text": "CKD: Blood pressure target for CKD patients is <130/80 mmHg."},
+    {"condition": "ckd", "text": "CKD: ACE inhibitor or ARB recommended for CKD patients with proteinuria."},
+    {"condition": "ckd", "text": "CKD: Nephrology referral recommended when eGFR falls below 30 mL/min."},
+    {"condition": "ckd", "text": "CKD: Anemia workup (CBC, iron studies, ESA consideration) recommended for CKD patients."},
+    {"condition": "ckd", "text": "CKD: Dietary protein restriction and phosphate management counseling recommended."},
+    {"condition": "ckd", "text": "CKD: Avoid NSAIDs, aminoglycosides, and nephrotoxic contrast agents — document counseling."},
+    {"condition": "ckd", "text": "CKD: Secondary hyperparathyroidism — monitor PTH every 3-6 months in stage III-V CKD."},
+    {"condition": "ckd", "text": "CKD: Hepatitis B vaccination recommended for all CKD patients not yet immune."},
+    {"condition": "ckd", "text": "CKD: Flu and pneumococcal vaccination recommended for all CKD patients."},
+
+    # ── ASTHMA ────────────────────────────────
+    {"condition": "asthma", "text": "Asthma: Annual spirometry/pulmonary function test recommended to assess control."},
+    {"condition": "asthma", "text": "Asthma: Inhaled corticosteroid is first-line controller therapy for persistent asthma."},
+    {"condition": "asthma", "text": "Asthma: Asthma action plan should be documented and provided to patient."},
+    {"condition": "asthma", "text": "Asthma: Referral to pulmonology if symptoms uncontrolled on moderate-dose ICS."},
+
+    # ── DYSLIPIDAEMIA ─────────────────────────
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: Fasting lipid panel should be checked annually."},
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: Statin therapy recommended for patients with cardiovascular risk >10% (10-year ASCVD risk)."},
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: LDL target <70 mg/dL for very high cardiovascular risk patients."},
+    {"condition": "dyslipidaemia", "text": "Dyslipidaemia: Lifestyle counseling on diet and exercise is required alongside pharmacotherapy."},
+
+    # ── GENERAL / PREVENTIVE ──────────────────
+    {"condition": "general", "text": "General: Smoking cessation counseling and pharmacotherapy is strongly recommended for all active smokers at every clinical encounter."},
+    {"condition": "general", "text": "General: Annual influenza vaccination recommended for all patients with chronic conditions."},
+    {"condition": "general", "text": "General: Pneumococcal vaccination (PCV15/PPSV23) recommended for immunocompromised patients and those with chronic disease."},
+    {"condition": "general", "text": "General: BMI should be documented and obesity management counseling provided if BMI >30."},
+]
+
+# Separate texts and condition tags for retrieval
+GUIDELINE_TEXTS      = [g["text"] for g in GUIDELINES]
+GUIDELINE_CONDITIONS = [g["condition"] for g in GUIDELINES]
+
+# Embed guidelines at startup
+print("Embedding clinical guidelines knowledge base...")
+guideline_embeddings = np.array(
+    [get_embedding(g) for g in GUIDELINE_TEXTS], dtype="float32"
+)
+guideline_index = faiss.IndexFlatL2(guideline_embeddings.shape[1])
+guideline_index.add(guideline_embeddings)
+print(f"✅ {len(GUIDELINES)} guidelines embedded and indexed.")
+
+
+# ─────────────────────────────────────────────
+# SQLITE — Structured patient data store
+# Replace connection with BigQuery in Phase 3
+# ─────────────────────────────────────────────
+
+
+def init_db():
+    schema = [
+        bigquery.SchemaField("patient_id",        "STRING"),
+        bigquery.SchemaField("primary_diagnosis",  "STRING"),
+        bigquery.SchemaField("procedure",          "STRING"),
+        bigquery.SchemaField("comorbidities",      "STRING"),
+        bigquery.SchemaField("medications",        "STRING"),
+        bigquery.SchemaField("key_findings",       "STRING"),
+        bigquery.SchemaField("risk_flags",         "STRING"),
+        bigquery.SchemaField("follow_up_actions",  "STRING"),
+        bigquery.SchemaField("risk_level",         "STRING"),
+        bigquery.SchemaField("source_note",        "STRING"),
+        bigquery.SchemaField("created_at",         "TIMESTAMP"),
+    ]
+    table = bigquery.Table(BQ_TABLE, schema=schema)
+    bq_client.create_table(table, exists_ok=True)
+    print(f"✅ BigQuery table initialised: {BQ_TABLE}")
+
+def save_patient(summary, source_note):
+    from datetime import datetime, timezone
+    patient_id = str(uuid.uuid4())[:8].upper()
+    flag_count = len(summary.get("risk_flags", []))
+    risk_level = "HIGH" if flag_count >= 3 else "MEDIUM" if flag_count >= 1 else "LOW"
+
+    row = {
+        "patient_id":        patient_id,
+        "primary_diagnosis": summary.get("primary_diagnosis", ""),
+        "procedure":         summary.get("procedure", ""),
+        "comorbidities":     json.dumps(summary.get("comorbidities", [])),
+        "medications":       json.dumps(summary.get("medications", [])),
+        "key_findings":      json.dumps(summary.get("key_findings", [])),
+        "risk_flags":        json.dumps(summary.get("risk_flags", [])),
+        "follow_up_actions": json.dumps(summary.get("follow_up_actions", [])),
+        "risk_level":        risk_level,
+        "source_note":       source_note,
+        "created_at":        datetime.now(timezone.utc).isoformat(),
+    }
+
+    errors = bq_client.insert_rows_json(BQ_TABLE, [row])
+    if errors:
+        print(f"❌ BigQuery insert error: {errors}")
+    else:
+        print(f"✅ Patient {patient_id} saved to BigQuery")
+
+    return patient_id
+
+def get_all_patients():
+    query = f"""
+        SELECT patient_id, primary_diagnosis, procedure, comorbidities,
+               medications, risk_flags, risk_level,
+               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', created_at) as created_at
+        FROM `{BQ_TABLE}`
+        ORDER BY created_at DESC
+    """
+    rows = bq_client.query(query).result()
+    return [dict(row) for row in rows]
+
+def get_patient_by_id(patient_id):
+    query = f"""
+        SELECT *
+        FROM `{BQ_TABLE}`
+        WHERE patient_id = @patient_id
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("patient_id", "STRING", patient_id)
+        ]
+    )
+    rows = list(bq_client.query(query, job_config=job_config).result())
+    return dict(rows[0]) if rows else None
+
+def get_patients_by_risk(risk_level):
+    query = f"""
+        SELECT patient_id, primary_diagnosis, procedure, risk_flags,
+               risk_level,
+               FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', created_at) as created_at
+        FROM `{BQ_TABLE}`
+        WHERE risk_level = @risk_level
+        ORDER BY created_at DESC
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("risk_level", "STRING", risk_level)
+        ]
+    )
+    rows = bq_client.query(query, job_config=job_config).result()
+    return [dict(row) for row in rows]
+
+def get_patient_stats():
+    query = f"""
+        SELECT
+            COUNT(*) as total,
+            COUNTIF(risk_level = 'HIGH')   as high,
+            COUNTIF(risk_level = 'MEDIUM') as medium,
+            COUNTIF(risk_level = 'LOW')    as low
+        FROM `{BQ_TABLE}`
+    """
+    row = list(bq_client.query(query).result())[0]
+    return {
+        "total":  row.total,
+        "high":   row.high,
+        "medium": row.medium,
+        "low":    row.low
+    }
+
+init_db()
+
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(Exception),
+    reraise=True
+)
+def get_claude_response(system_prompt, user_prompt, max_tokens=1500, temperature=0.0):
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"Claude API error (will retry): {e}")
+        raise
+
+def clean_json(text):
+    text = text.strip()
+    text = re.sub(r"^```json", "", text)
+    text = re.sub(r"^```",     "", text)
+    text = re.sub(r"```$",     "", text)
+    return text.strip()
+
+def chunk_text(text, chunk_size=512):
+    words        = text.split()
+    approx_words = int(chunk_size / 1.3)
+    if len(words) <= approx_words:
+        return [text]
+    return [
+        " ".join(words[i:i+approx_words])
+        for i in range(0, len(words), approx_words)
+    ]
+
+# Maps clinical keywords to condition categories
+CONDITION_MAP = {
+    "diabetes":           "diabetes",
+    "diabetic":           "diabetes",
+    "hyperglycemia":      "diabetes",
+    "hba1c":              "diabetes",
+    "heart failure":      "heart_failure",
+    "chf":                "heart_failure",
+    "cardiomyopathy":     "heart_failure",
+    "hfref":              "heart_failure",
+    "hypertension":       "hypertension",
+    "high blood pressure":"hypertension",
+    "ckd":                "ckd",
+    "chronic kidney":     "ckd",
+    "renal insufficiency":"ckd",
+    "nephropathy":        "ckd",
+    "kidney disease":     "ckd",
+    "asthma":             "asthma",
+    "dyslipidemia":       "dyslipidaemia",
+    "dyslipidaemia":      "dyslipidaemia",
+    "hyperlipidemia":     "dyslipidaemia",
+    "cholesterol":        "dyslipidaemia",
+}
+
+def detect_conditions(summary):
+    """Detect which condition categories apply to this patient"""
+    detected = set(["general"])  # always include general guidelines
+    search_text = summary.get("primary_diagnosis", "").lower()
+    for c in summary.get("comorbidities", []):
+        search_text += " " + c.lower()
+    for keyword, tag in CONDITION_MAP.items():
+        if keyword in search_text:
+            detected.add(tag)
+    return detected
+
+def retrieve_relevant_guidelines(query, summary=None, k=12):
+    """
+    If summary provided, filter guidelines by patient's actual conditions.
+    Prevents CHF guidelines firing on hypertension-only patients.
+    """
+    query_vec = np.array([get_embedding(query)], dtype="float32")
+    D, I = guideline_index.search(query_vec, k=min(k*2, len(GUIDELINES)))
+
+    if summary:
+        detected_conditions = detect_conditions(summary)
+        filtered = []
+        for idx in I[0]:
+            guideline_condition = GUIDELINE_CONDITIONS[idx]
+            if guideline_condition in detected_conditions:
+                filtered.append(GUIDELINE_TEXTS[idx])
+            if len(filtered) >= k:
+                break
+        # If too few, pad with unfiltered
+        if len(filtered) < 3:
+            for idx in I[0]:
+                if GUIDELINE_TEXTS[idx] not in filtered:
+                    filtered.append(GUIDELINE_TEXTS[idx])
+                if len(filtered) >= k:
+                    break
+        return filtered
+    else:
+        return [GUIDELINE_TEXTS[i] for i in I[0][:k]]
+
+def scrape_url_content(url):
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Try MTSamples-specific selectors in order
+        # Try MTSamples-specific selectors in order
+        for selector in [
+            {"id": "fullText"},
+            {"class": "transcription"},
+            {"class": "sample-content"},
+            {"class": "sample"},
+            {"id": "sample-text"},
+            {"class": "col w-100 p-2"},   # ← current MTSamples structure
+        ]:
+            div = soup.find("div", selector)
+            if div:
+                text = div.get_text(separator="\n").strip()
+                if len(text.split()) > 50:
+                    return text
+
+        # Fallback — grab paragraphs but skip legal notice
+        paragraphs = soup.find_all("p")
+        texts = []
+        for p in paragraphs:
+            t = p.get_text().strip()
+            if "Legal & Usage Notice" in t:
+                continue
+            if "MTHelpLine" in t:
+                continue
+            if len(t) > 30:
+                texts.append(t)
+        text = "\n".join(texts).strip()
+        return text if len(text.split()) > 50 else None
+
+    except Exception:
+        return None
+
+async def scrape_url_async(client, url):
+    """Async version of scraper — runs concurrently with other URLs"""
+    try:
+        resp = await client.get(url, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        main = soup.select_one("div.col-lg-9.mainContent")
+        if main:
+            text = main.get_text(separator=" ").strip()
+            text = re.sub(r"\s+", " ", text)
+            match = re.search(r"Sample Name:", text)
+            if not match:
+                match = re.search(
+                    r"(REASON FOR VISIT|CHIEF COMPLAINT|HISTORY OF PRESENT ILLNESS|"
+                    r"SUBJECTIVE|PREOPERATIVE DIAGNOSIS|ADMISSION DIAGNOSIS|"
+                    r"CONSULTATION|DISCHARGE SUMMARY|PROCEDURE)", text
+                )
+            if match:
+                text = text[match.start():]
+            noise = [
+                "Intended for: Medical transcription students, transcriptionists, and educators practicing clinical documentation formats in General Medicine.",
+                "Discover more", "Newspapers", "News",
+                "Secure transcription solutions", "Medical transcription software",
+                "Nasal Sprays", "Drugs & Medications", "Health Conditions",
+            ]
+            for n in noise:
+                text = text.replace(n, "")
+            for stop in ["About This Sample:", "Legal & Usage Notice",
+                         "Related Samples", "Keywords:", "Go Back to"]:
+                if stop in text:
+                    text = text[:text.index(stop)]
+                    break
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text.split()) > 50:
+                return url, text, None
+
+        return url, None, "No clinical content found"
+
+    except Exception as e:
+        return url, None, str(e)
+
+
+async def scrape_urls_async(urls):
+    """Launch all URL scrapes at the same time"""
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0"},
+        follow_redirects=True
+    ) as client:
+        tasks = [scrape_url_async(client, url) for url in urls]
+        results = await asyncio.gather(*tasks)
+    return results
+
+#with #chroma db
+# def index_note(url, text, patient_id=None):
+#     chunks = chunk_text(text, chunk_size=512)
+#     for i, chunk in enumerate(chunks):
+#         chunk_id  = f"{abs(hash(url))}_{i}"
+#         embedding = get_embedding(chunk)
+#         notes_collection.upsert(
+#             ids=[chunk_id],
+#             embeddings=[embedding],
+#             documents=[chunk],
+#             metadatas=[{"url": url, "chunk": i, "patient_id": patient_id or ""}]
+#         )
+#     return len(chunks)
+
+# with upstash
+def index_note(url, text, patient_id=None):
+    chunks  = chunk_text(text, chunk_size=512)
+    vectors = []
+    for i, chunk in enumerate(chunks):
+        chunk_id  = f"{abs(hash(url))}_{i}"
+        embedding = get_embedding(chunk)
+        vectors.append({
+            "id":       chunk_id,
+            "vector":   embedding,
+            "data":     chunk,
+            "metadata": {"url": url, "chunk": i, "patient_id": patient_id or ""}
+        })
+    notes_collection.upsert(vectors=vectors)
+    return len(chunks)
+
+#with #chroma db
+# def search_notes(query, top_k=5):
+#     count = notes_collection.count()
+#     if count == 0:
+#         return []
+#     query_vec = get_embedding(query)
+#     results   = notes_collection.query(
+#         query_embeddings=[query_vec],
+#         n_results=min(top_k, count)
+#     )
+#     if not results["ids"][0]:
+#         return []
+#     return list(zip(results["documents"][0], results["metadatas"][0]))
+
+
+def search_notes(query, top_k=5):
+    query_vec = get_embedding(query)
+    results   = notes_collection.query(
+        vector=query_vec,
+        top_k=top_k,
+        include_metadata=True,
+        include_data=True
+    )
+    if not results:
+        return []
+    return [(r.data or "", r.metadata) for r in results]
+
+def base_context(**kwargs):
+    stats = get_patient_stats()
+    defaults = dict(
+        summary=None, gaps=None,
+        guideline_count=len(GUIDELINES),
+        #notes_count=notes_collection.count(), #with chromadb
+        notes_count=notes_collection.info().vector_count,
+        ingest_results=None,
+        search_results=None,
+        search_query=None,
+        note_text=None,
+        patient_id=None,
+        patients=None,
+        stats=stats,
+        active_tab="summarize",
+        ask_question=None,
+        ask_answer=None,
+        ask_sources=None,
+        ask_chunks=None,
+        out_of_scope_reason=None    # ← new
+    )
+    defaults.update(kwargs)
+    return defaults
+
+
+# ─────────────────────────────────────────────
+# PATIENT DETAIL TEMPLATE
+# ─────────────────────────────────────────────
+PATIENT_DETAIL_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Patient {{ patient.patient_id }}</title>
+  <style>
+    body  { font-family:Arial,sans-serif; max-width:860px; margin:40px auto; padding:0 20px; background:#f5f7fa; }
+    h1    { color:#1a365d; }
+    .card { background:white; border-radius:8px; padding:20px; margin:16px 0; border-left:4px solid #2b6cb0; }
+    .label{ font-weight:bold; color:#4a5568; font-size:13px; text-transform:uppercase; letter-spacing:0.5px; display:block; margin-bottom:6px; }
+    .tag  { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; margin:2px; }
+    .tag-high   { background:#fed7d7; color:#c53030; }
+    .tag-medium { background:#fefcbf; color:#744210; }
+    .tag-low    { background:#c6f6d5; color:#22543d; }
+    ul { padding-left:20px; } li { margin:6px 0; }
+    .back { color:#2b6cb0; text-decoration:none; font-size:14px; }
+    pre   { background:#edf2f7; padding:16px; border-radius:8px; font-size:12px; white-space:pre-wrap; word-wrap:break-word; }
+    .section { margin-top:16px; }
+  </style>
+</head>
+<body>
+  <a class="back" href="/patients">← Back to Patients</a>
+  <h1>Patient {{ patient.patient_id }}</h1>
+  <p style="color:#718096; font-size:13px;">Added: {{ patient.created_at }}</p>
+
+  <div class="card">
+    <span class="tag {% if patient.risk_level == 'HIGH' %}tag-high{% elif patient.risk_level == 'MEDIUM' %}tag-medium{% else %}tag-low{% endif %}"
+      style="font-size:14px; padding:6px 16px;">
+      {{ patient.risk_level }} RISK
+    </span>
+    <div class="section">
+      <span class="label">Primary Diagnosis</span>
+      <p>{{ patient.primary_diagnosis }}</p>
+    </div>
+    <div class="section">
+      <span class="label">Comorbidities</span>
+      <ul>{% for c in patient.comorbidities %}<li>{{ c }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <span class="label">Medications</span>
+      <ul>{% for m in patient.medications %}<li>{{ m }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <span class="label">Key Clinical Findings</span>
+      <ul>{% for f in patient.key_findings %}<li>{{ f }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <span class="label">Risk Flags</span>
+      {% for r in patient.risk_flags %}
+        <span class="tag tag-high">⚠️ {{ r }}</span>
+      {% else %}
+        <span style="color:#276749;">✅ No risk flags</span>
+      {% endfor %}
+    </div>
+    <div class="section">
+      <span class="label">Follow-up Actions</span>
+      <ul>{% for a in patient.follow_up_actions %}<li>{{ a }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+  </div>
+
+  <div class="card" style="border-left-color:#718096;">
+    <span class="label">Original Clinical Note</span>
+    <pre style="margin-top:8px;">{{ patient.source_note }}</pre>
+  </div>
+</body>
+</html>
+"""
+
+
+# ─────────────────────────────────────────────
+# MAIN HTML TEMPLATE
+# ─────────────────────────────────────────────
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Clinical AI Assistant</title>
+  <style>
+    body   { font-family:Arial,sans-serif; max-width:960px; margin:40px auto; padding:0 20px; background:#f5f7fa; }
+    h1     { color:#1a365d; }
+    h2     { color:#2c5282; border-bottom:2px solid #bee3f8; padding-bottom:8px; }
+    textarea         { width:100%; height:200px; padding:10px; border:1px solid #cbd5e0; border-radius:6px; font-size:14px; }
+    input[type=text] { width:100%; padding:10px; border:1px solid #cbd5e0; border-radius:6px; font-size:14px; }
+    .btn        { background:#2b6cb0; color:white; padding:10px 24px; border:none; border-radius:6px; cursor:pointer; font-size:15px; margin-right:8px; }
+    .btn:hover  { background:#2c5282; }
+    .btn-green  { background:#276749; } .btn-green:hover  { background:#22543d; }
+    .btn-purple { background:#553c9a; } .btn-purple:hover { background:#44337a; }
+    .btn-orange { background:#c05621; } .btn-orange:hover { background:#9c4221; }
+    .btn-red    { background:#c53030; } .btn-red:hover    { background:#9b2c2c; }
+    .btn-yellow { background:#b7791f; } .btn-yellow:hover { background:#975a16; }
+    .btn-sm     { padding:6px 14px; font-size:12px; }
+    .card       { background:white; border-radius:8px; padding:20px; margin:20px 0; border-left:4px solid #2b6cb0; }
+    .card-red   { border-left-color:#c53030; }
+    .card-purple{ border-left-color:#553c9a; }
+    .tag        { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; margin:2px; }
+    .tag-high   { background:#fed7d7; color:#c53030; }
+    .tag-medium { background:#fefcbf; color:#744210; }
+    .tag-low    { background:#c6f6d5; color:#22543d; }
+    ul { padding-left:20px; } li { margin:6px 0; }
+    .section    { margin:12px 0; }
+    .label      { font-weight:bold; color:#4a5568; font-size:13px; text-transform:uppercase; letter-spacing:0.5px; }
+    .tabs       { display:flex; margin-bottom:20px; flex-wrap:wrap; }
+    .tab        { padding:10px 18px; cursor:pointer; border:1px solid #cbd5e0; background:#edf2f7; font-weight:500; font-size:13px; }
+    .tab.active { background:#2b6cb0; color:white; border-color:#2b6cb0; }
+    .tab:first-child { border-radius:6px 0 0 6px; }
+    .tab:last-child  { border-radius:0 6px 6px 0; }
+    .form-panel { display:none; }
+    .form-panel.active { display:block; }
+    .controls   { display:flex; gap:32px; margin-bottom:16px; background:#edf2f7; padding:14px; border-radius:8px; flex-wrap:wrap; }
+    .control-group label { font-weight:600; font-size:13px; }
+    .control-group input[type=range] { width:200px; display:block; margin:4px 0; }
+    .hint       { font-size:11px; color:#718096; }
+    .count-badge{ background:#ebf8ff; color:#2b6cb0; padding:4px 12px; border-radius:12px; font-weight:600; font-size:13px; }
+    .stat-row   { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+    .stat-box   { padding:12px 18px; border-radius:8px; text-align:center; min-width:80px; }
+    .stat-box .num { font-size:24px; font-weight:700; }
+    .stat-box .lbl { font-size:11px; text-transform:uppercase; letter-spacing:0.5px; margin-top:2px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th    { background:#edf2f7; padding:10px; text-align:left; }
+    td    { padding:10px; border-bottom:1px solid #e2e8f0; }
+    .source-badge { font-size:11px; color:#718096; margin-bottom:6px; }
+    .note-text    { font-size:13px; color:#2d3748; line-height:1.6; }
+    .ingest-row   { padding:8px 0; border-bottom:1px solid #e2e8f0; font-size:13px; }
+    .saved-banner { background:#c6f6d5; border:1px solid #68d391; border-radius:8px; padding:12px 16px; margin-bottom:16px; color:#22543d; font-weight:600; }
+  </style>
+  <script>
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.form-panel').forEach(p => p.classList.remove('active'));
+      document.getElementById('tab-' + tab).classList.add('active');
+      document.getElementById('panel-' + tab).classList.add('active');
+    }
+  </script>
+</head>
+<body>
+
+  <h1>🏥 Clinical AI Assistant</h1>
+  <p style="color:#718096; margin-bottom:12px;">
+    Powered by Claude + RAG · SQLite patient store · ChromaDB vector search
+  </p>
+
+  <!-- STATS BAR -->
+  <div class="stat-row">
+    <div class="stat-box" style="background:#ebf8ff; color:#2b6cb0;">
+      <div class="num">{{ stats.total }}</div><div class="lbl">Patients</div>
+    </div>
+    <div class="stat-box" style="background:#fff5f5; color:#c53030;">
+      <div class="num">{{ stats.high }}</div><div class="lbl">High Risk</div>
+    </div>
+    <div class="stat-box" style="background:#fffff0; color:#b7791f;">
+      <div class="num">{{ stats.medium }}</div><div class="lbl">Medium Risk</div>
+    </div>
+    <div class="stat-box" style="background:#f0fff4; color:#276749;">
+      <div class="num">{{ stats.low }}</div><div class="lbl">Low Risk</div>
+    </div>
+    <div class="stat-box" style="background:#faf5ff; color:#553c9a;">
+      <div class="num">{{ notes_count }}</div><div class="lbl">Note Chunks</div>
+    </div>
+    <div class="stat-box" style="background:#fffaf0; color:#c05621;">
+      <div class="num">{{ guideline_count }}</div><div class="lbl">Guidelines</div>
+    </div>
+  </div>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <div class="tab {% if active_tab == 'summarize' %}active{% endif %}" id="tab-summarize" onclick="switchTab('summarize')">📋 Summarizer</div>
+    <div class="tab {% if active_tab == 'gaps' %}active{% endif %}"      id="tab-gaps"      onclick="switchTab('gaps')">🔍 Care Gaps</div>
+    <div class="tab {% if active_tab == 'ingest' %}active{% endif %}"    id="tab-ingest"    onclick="switchTab('ingest')">📥 Ingest Notes</div>
+    <div class="tab {% if active_tab == 'search' %}active{% endif %}"    id="tab-search"    onclick="switchTab('search')">🔎 Search Notes</div>
+    <div class="tab {% if active_tab == 'patients' %}active{% endif %}"  id="tab-patients"  onclick="switchTab('patients')">🗂️ Patients</div>
+    <div class="tab {% if active_tab == 'ask' %}active{% endif %}" id="tab-ask" onclick="switchTab('ask')">💬 Ask Notes</div>
+  </div>
+
+  <!-- ── SUMMARIZER ─────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'summarize' %}active{% endif %}" id="panel-summarize">
+    <form method="post" action="/summarize">
+      <p style="color:#4a5568;">
+        Paste any clinical note or discharge summary.
+        Structured data is automatically saved to the patient database.
+      </p>
+      <textarea name="clinical_note" placeholder="Paste clinical note here...">{{ note_text or '' }}</textarea>
+      <br><br>
+      <div class="controls">
+        <div class="control-group">
+          <label>🌡️ Temperature: <span id="ts">0.0</span></label>
+          <input type="range" name="temperature" min="0" max="1" step="0.1" value="0.0"
+            oninput="document.getElementById('ts').textContent=this.value">
+          <div class="hint">0.0 = precise &nbsp;|&nbsp; 1.0 = creative</div>
+        </div>
+        <div class="control-group">
+          <label>📏 Max Tokens: <span id="ms">1500</span></label>
+          <input type="range" name="max_tokens" min="200" max="2000" step="100" value="1500"
+            oninput="document.getElementById('ms').textContent=this.value">
+          <div class="hint">200 = brief &nbsp;|&nbsp; 2000 = detailed</div>
+        </div>
+      </div>
+      <button type="submit" class="btn">📋 Generate Summary + Save Patient</button>
+    </form>
+  </div>
+
+  <!-- ── CARE GAPS ───────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'gaps' %}active{% endif %}" id="panel-gaps">
+    <form method="post" action="/caregaps">
+      <p style="color:#4a5568;">
+        Paste a patient's clinical note. Checked against {{ guideline_count }} embedded clinical guidelines.
+      </p>
+      <textarea name="clinical_note" placeholder="Paste patient clinical note here...">{{ note_text or '' }}</textarea>
+      <br><br>
+      <div class="controls">
+        <div class="control-group">
+          <label>🌡️ Temperature: <span id="tg">0.0</span></label>
+          <input type="range" name="temperature" min="0" max="1" step="0.1" value="0.0"
+            oninput="document.getElementById('tg').textContent=this.value">
+          <div class="hint">0.0 = precise &nbsp;|&nbsp; 1.0 = creative</div>
+        </div>
+        <div class="control-group">
+          <label>📏 Max Tokens: <span id="mg">1500</span></label>
+          <input type="range" name="max_tokens" min="200" max="2000" step="100" value="1500"
+            oninput="document.getElementById('mg').textContent=this.value">
+          <div class="hint">200 = brief &nbsp;|&nbsp; 2000 = detailed</div>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-green">🔍 Identify Care Gaps</button>
+    </form>
+  </div>
+
+  <!-- ── INGEST ──────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'ingest' %}active{% endif %}" id="panel-ingest">
+    <form method="post" action="/ingest">
+      <p style="color:#4a5568;">
+        Paste one or more URLs — one per line. Works with MTSamples or any page with clinical text.<br>
+        <span class="hint">
+          Try: https://mtsamples.com/?page=site/sites/op=op&amp;type=Endocrinology&amp;sample=44-Diabetes+mellitus+Type+2
+        </span>
+      </p>
+      <textarea name="urls" placeholder="https://mtsamples.com/...&#10;https://mtsamples.com/..."></textarea>
+      <br><br>
+      <div style="margin-bottom:16px; padding:12px; background:#edf2f7; border-radius:8px; display:flex; align-items:center; gap:10px;">
+  <input type="checkbox" name="auto_summarize" id="auto_summarize" style="width:16px; height:16px;">
+  <label for="auto_summarize" style="font-size:14px; font-weight:500; cursor:pointer;">
+    🤖 Auto-summarize &amp; create patient records
+    <span style="font-size:11px; color:#718096; font-weight:400; display:block; margin-top:2px;">
+      Calls Claude for each URL — takes longer but creates patient records automatically
+    </span>
+  </label>
+</div>
+
+      <button type="submit" class="btn btn-purple">📥 Scrape &amp; Index Notes</button>
+    </form>
+    {% if ingest_results %}
+    <div class="card card-purple" style="margin-top:20px;">
+      <h2>📥 Ingest Results</h2>
+      {% for r in ingest_results %}
+      <div class="ingest-row">
+        {% if r.success %}
+  ✅ <b>{{ r.url[:70] }}</b> — {{ r.chunks }} chunks indexed
+  {% if r.patient_id %}
+    | 🧑‍⚕️ <a href="/patient/{{ r.patient_id }}" style="color:#553c9a;">Patient {{ r.patient_id }}</a>
+  {% endif %}
+  {% if r.error %}
+    | ⚠️ {{ r.error }}
+  {% endif %}
+{% else %}
+  ❌ <b>{{ r.url[:70] }}</b> — {{ r.error or 'Failed to scrape' }}
+{% endif %}
+      </div>
+      {% endfor %}
+      <p style="margin-top:12px;"><span class="count-badge">Total indexed: {{ notes_count }} chunks</span></p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ── SEARCH ──────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'search' %}active{% endif %}" id="panel-search">
+    <form method="post" action="/search">
+      <p style="color:#4a5568;">
+        Semantic search across all indexed notes.
+        <span class="count-badge">{{ notes_count }} chunks indexed</span>
+      </p>
+      <input type="text" name="query"
+        placeholder="e.g. patients with uncontrolled diabetes and high HbA1c"
+        value="{{ search_query or '' }}">
+      <br><br>
+      <button type="submit" class="btn btn-orange">🔎 Search</button>
+    </form>
+    {% if search_results %}
+    <div class="card" style="margin-top:20px;">
+      <h2>🔎 Search Results</h2>
+      <p style="color:#718096; font-size:13px;">Query: <i>"{{ search_query }}"</i> · {{ search_results|length }} results</p>
+      {% for doc, meta in search_results %}
+      <div style="margin:16px 0; padding:14px; background:#f7fafc; border-radius:6px; border-left:3px solid #2b6cb0;">
+        <div class="source-badge">
+          Source: {{ meta.url }}
+          {% if meta.patient_id %} | Patient: <a href="/patient/{{ meta.patient_id }}" style="color:#2b6cb0;">{{ meta.patient_id }}</a>{% endif %}
+          | Chunk {{ meta.chunk }}
+        </div>
+        <div class="note-text">{{ doc[:400] }}{% if doc|length > 400 %}...{% endif %}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if search_results is not none and search_results|length == 0 %}
+    <div class="card" style="margin-top:20px;">
+      <p style="color:#c53030;">No notes indexed yet. Use 📥 Ingest or 📋 Summarizer to add notes.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ── ASK ─────────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'ask' %}active{% endif %}" id="panel-ask">
+    <form method="post" action="/ask">
+      <p style="color:#4a5568;">
+        Ask any clinical question about your indexed notes. Claude will search and synthesize an answer.<br>
+        <span class="hint">
+          Try: "What insulin adjustments were made?" or "Which patients have uncontrolled hypertension?" 
+          or "Summarise the CKD patients in my notes"
+        </span>
+      </p>
+      <input type="text" name="question"
+        placeholder="Ask anything about your clinical notes..."
+        value="{{ ask_question or '' }}">
+      <br><br>
+      <button type="submit" class="btn" style="background:#0d6efd;">💬 Ask</button>
+    </form>
+
+    {% if ask_answer %}
+    <div class="card" style="margin-top:20px; border-left-color:#0d6efd;">
+      <h2>💬 Answer</h2>
+      <p style="color:#718096; font-size:13px;">
+        Question: <i>"{{ ask_question }}"</i>
+        &nbsp;|&nbsp; Based on {{ ask_sources|length }} source chunks
+      </p>
+      <div style="font-size:14px; color:#2d3748; line-height:1.8; white-space:pre-wrap;">{{ ask_answer }}</div>
+    </div>
+
+    {% if ask_sources %}
+    <div class="card" style="border-left-color:#718096; margin-top:0;">
+      <h3 style="color:#4a5568; font-size:14px; margin-bottom:12px;">📎 Sources Used</h3>
+      {% for num, url in ask_sources %}
+      <div style="font-size:12px; color:#718096; padding:4px 0; border-bottom:1px solid #f1f5f9;">
+        <b>Source {{ num }}:</b> {{ url }}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if ask_chunks %}
+    <details style="margin-top:12px;">
+      <summary style="cursor:pointer; font-size:13px; color:#2b6cb0; font-weight:600;">
+        📄 View raw chunks used ({{ ask_chunks|length }})
+      </summary>
+      {% for doc, meta in ask_chunks %}
+      <div style="margin:10px 0; padding:12px; background:#f7fafc; border-radius:6px; font-size:12px; color:#4a5568; border-left:3px solid #bee3f8;">
+        <div style="color:#718096; margin-bottom:4px;">{{ meta.url }} | Chunk {{ meta.chunk }}</div>
+        {{ doc[:300] }}{% if doc|length > 300 %}...{% endif %}
+      </div>
+      {% endfor %}
+    </details>
+    {% endif %}
+    {% endif %}
+  </div>
+
+  <!-- ── PATIENTS ────────────────────────────────────────────── -->
+  <div class="form-panel {% if active_tab == 'patients' %}active{% endif %}" id="panel-patients">
+    <div style="display:flex; gap:8px; margin-bottom:20px; flex-wrap:wrap;">
+      <a href="/patients" style="text-decoration:none;">
+        <button class="btn btn-sm">👥 All ({{ stats.total }})</button>
+      </a>
+      <a href="/patients?risk=HIGH" style="text-decoration:none;">
+        <button class="btn btn-sm btn-red">🔴 High Risk ({{ stats.high }})</button>
+      </a>
+      <a href="/patients?risk=MEDIUM" style="text-decoration:none;">
+        <button class="btn btn-sm btn-yellow">🟡 Medium Risk ({{ stats.medium }})</button>
+      </a>
+      <a href="/patients?risk=LOW" style="text-decoration:none;">
+        <button class="btn btn-sm btn-green">🟢 Low Risk ({{ stats.low }})</button>
+      </a>
+    </div>
+    {% if patients %}
+    <div class="card">
+      <h2>🗂️ Patient Records <span class="count-badge" style="margin-left:10px;">{{ patients|length }} shown</span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Patient ID</th><th>Primary Diagnosis</th><th>Procedure</th><th>Risk Flags</th>
+            <th>Risk Level</th><th>Added</th><th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in patients %}
+          <tr>
+            <td style="font-weight:600; color:#2b6cb0;">{{ p.patient_id }}</td>
+            <td>{{ p.primary_diagnosis[:50] }}{% if p.primary_diagnosis|length > 50 %}...{% endif %}</td>
+            <td style="color:#718096; font-size:12px;">{{ p.procedure or '—' }}</td>
+            <td>
+              {% set flags = p.risk_flags | fromjson %}
+              {% for f in flags[:2] %}<span class="tag tag-high" style="font-size:10px;">{{ f[:25] }}</span>{% endfor %}
+              {% if flags|length > 2 %}<span style="font-size:11px; color:#718096;">+{{ flags|length - 2 }} more</span>{% endif %}
+            </td>
+            <td>
+              <span class="tag {% if p.risk_level == 'HIGH' %}tag-high{% elif p.risk_level == 'MEDIUM' %}tag-medium{% else %}tag-low{% endif %}">
+                {{ p.risk_level }}
+              </span>
+            </td>
+            <td style="color:#718096; font-size:12px;">{{ p.created_at[:16] }}</td>
+            <td><a href="/patient/{{ p.patient_id }}" style="color:#2b6cb0; font-size:12px;">View →</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% elif patients is not none %}
+    <div class="card">
+      <p style="color:#718096;">No patients yet. Use 📋 Summarizer to process clinical notes — each note is saved as a patient record.</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- OUT OF SCOPE BANNER -->
+  {% if out_of_scope_reason %}
+  <div style="background:#fffff0; border:1px solid #f6e05e; border-radius:8px; padding:16px; margin-top:20px;">
+    <b>⚠️ Out of Scope Note</b> — {{ out_of_scope_reason }}<br>
+    <span style="font-size:13px; color:#718096; margin-top:6px; display:block;">
+      No patient record was created. Supported: Diabetes, Hypertension, Heart Failure, CKD, Asthma, Dyslipidaemia.
+    </span>
+  </div>
+  {% endif %}
+
+  {% if summary %}
+  {% if patient_id %}
+  <div class="saved-banner">
+    ✅ Patient saved — ID: <b>{{ patient_id }}</b>
+    &nbsp;|&nbsp; <a href="/patient/{{ patient_id }}" style="color:#22543d;">View Patient Record →</a>
+  </div>
+  {% endif %}
+  <div class="card">
+    <h2>📋 Clinical Summary</h2>
+    <div class="section">
+      <div class="label">Primary Diagnosis</div>
+      <p>{{ summary.primary_diagnosis }}</p>
+    </div>
+    <div class="section">
+      <div class="label">Comorbidities</div>
+      <ul>{% for c in summary.comorbidities %}<li>{{ c }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <div class="label">Current Medications</div>
+      <ul>{% for m in summary.medications %}<li>{{ m }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <div class="label">Key Clinical Findings</div>
+      <ul>{% for f in summary.key_findings %}<li>{{ f }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+    <div class="section">
+      <div class="label">Risk Flags</div>
+      {% for r in summary.risk_flags %}
+        <span class="tag tag-high">⚠️ {{ r }}</span>
+      {% else %}
+        <span style="color:#276749;">✅ No risk flags identified</span>
+      {% endfor %}
+    </div>
+    <div class="section">
+      <div class="label">Follow-up Actions</div>
+      <ul>{% for a in summary.follow_up_actions %}<li>{{ a }}</li>{% else %}<li style="color:#718096;">None documented</li>{% endfor %}</ul>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ── GAP RESULTS ────────────────────────────────────────── -->
+  {% if gaps %}
+  <div class="card card-red">
+    <h2>🔍 Care Gap Analysis</h2>
+    <p style="color:#718096; font-size:13px;">Checked against {{ guideline_count }} embedded clinical guidelines</p>
+    {% if gaps.gaps %}
+      {% for gap in gaps.gaps %}
+      <div style="margin:16px 0; padding:14px; background:#fff5f5; border-radius:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+          <strong>{{ gap.gap }}</strong>
+          <span class="tag tag-{{ gap.priority | lower }}">{{ gap.priority }}</span>
+        </div>
+        <div style="margin-top:8px; font-size:13px; color:#4a5568;">
+          <b>Guideline:</b> {{ gap.guideline }}<br>
+          <b>Recommendation:</b> {{ gap.recommendation }}
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p style="color:#276749;">✅ No significant care gaps identified.</p>
+    {% endif %}
+    {% if gaps.summary %}
+    <div style="margin-top:16px; padding:12px; background:#ebf8ff; border-radius:6px;">
+      <b>Clinical Assessment:</b> {{ gaps.summary }}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+</body>
+</html>
+"""
+
+
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
+@app.route("/")
+def home():
+    return render_template_string(TEMPLATE, **base_context())
+
+
+@app.route("/summarize", methods=["POST"])
+def summarize():
+    note        = request.form.get("clinical_note", "").strip()
+    temperature = float(request.form.get("temperature", 0.0))
+    max_tokens  = int(request.form.get("max_tokens", 1500))
+
+    if not note:
+        return render_template_string(TEMPLATE, **base_context())
+
+    system_prompt = """You are a clinical documentation specialist.
+Extract structured information from the clinical note provided.
+Always respond with valid JSON only — no markdown, no explanation."""
+
+    user_prompt = f"""
+First determine if this note is IN SCOPE for chronic disease management.
+
+IN SCOPE: diabetes, hypertension, heart failure, CKD, asthma, dyslipidaemia,
+general medicine chronic disease follow-up, endocrinology, nephrology, cardiology
+for chronic conditions.
+
+OUT OF SCOPE: surgical procedure notes (excisions, biopsies, repairs),
+dermatology procedures, orthopaedic procedures, acute one-time procedures,
+anaesthesia notes, operative reports for non-chronic conditions.
+
+If OUT OF SCOPE return exactly:
+{{"out_of_scope": true, "reason": "brief explanation of why this note is out of scope"}}
+
+If IN SCOPE extract and return this JSON:
+{{
+  "out_of_scope": false,
+  "primary_diagnosis": "specific diagnosis with severity/stage if mentioned",
+  "procedure": "name of any procedure performed in this encounter, or empty string if none",
+  "comorbidities": [
+    "list diagnosed medical conditions only",
+    "do NOT include symptoms like fatigue or blurred vision",
+    "do NOT include family history"
+  ],
+  "medications": [
+    "list each medication individually with dose and frequency",
+    "ONLY include ongoing medications the patient takes at home",
+    "do NOT include anaesthetics, suture materials, IV fluids, or surgical supplies"
+  ],
+  "key_findings": [
+    "lab values with numbers (HbA1c, eGFR, BNP, creatinine, lipids)",
+    "abnormal vital signs",
+    "examination findings relevant to chronic disease"
+  ],
+  "risk_flags": [
+    "urgent concerns requiring immediate clinical attention",
+    "uncontrolled values significantly above target",
+    "missing critical medications for the diagnosed condition"
+  ],
+  "follow_up_actions": [
+    "specific recommended next steps from the note",
+    "referrals mentioned or implied"
+  ]
+}}
+
+Clinical Note:
+{note}
+"""
+
+    raw = get_claude_response(system_prompt, user_prompt,
+                              max_tokens=max_tokens, temperature=temperature)
+    raw = clean_json(raw)
+
+    try:
+        raw_dict = json.loads(raw)
+        summary  = ClinicalSummary(**raw_dict)
+    except json.JSONDecodeError:
+        return f"<h3>JSON parsing failed:</h3><pre>{raw}</pre>"
+    except Exception as e:
+        print(f"Pydantic validation error: {e}")
+        # Try to salvage without problematic fields
+        try:
+            raw_dict = json.loads(raw)
+            raw_dict["medications"]   = []
+            raw_dict["comorbidities"] = []
+            summary = ClinicalSummary(**raw_dict)
+        except Exception:
+            return f"<h3>Validation failed:</h3><pre>{str(e)}</pre>"
+
+    # Handle out of scope
+    if summary.out_of_scope:
+        return render_template_string(TEMPLATE, **base_context(
+            active_tab="summarize",
+            note_text=note,
+            out_of_scope_reason=summary.reason or "Outside supported disease programmes."
+        ))
+
+    # Save to SQLite — convert Pydantic model to dict first
+    patient_id = save_patient(summary.dict(), note)
+
+    # Save to ChromaDB — vector layer, linked to patient_id
+    flag_count = len(summary.risk_flags)
+    risk_level = "HIGH" if flag_count >= 3 else "MEDIUM" if flag_count >= 1 else "LOW"
+    
+    notes_collection.upsert(vectors=[{
+        "id":       f"patient_{patient_id}",
+        "vector":   get_embedding(note),
+        "data":     note,
+        "metadata": {
+            "patient_id":        patient_id,
+            "primary_diagnosis": summary.primary_diagnosis,
+            "risk_level":        risk_level,
+            "url":               "manual_entry",
+            "chunk":             0
+        }
+    }])
+
+    return render_template_string(TEMPLATE, **base_context(
+        summary=summary, note_text=note, patient_id=patient_id
+    ))
+
+
+@app.route("/caregaps", methods=["POST"])
+def caregaps():
+    note        = request.form.get("clinical_note", "").strip()
+    temperature = float(request.form.get("temperature", 0.0))
+    max_tokens  = int(request.form.get("max_tokens", 1500))
+
+    if not note:
+        return render_template_string(TEMPLATE, **base_context())
+
+    # Quick lightweight extraction to detect patient conditions
+    try:
+        quick_raw = get_claude_response(
+            "Return only valid JSON, no explanation.",
+            f"""Extract just diagnosis and comorbidities as JSON:
+{{"primary_diagnosis": "...", "comorbidities": ["..."]}}
+Note: {note[:1000]}""",
+            max_tokens=300, temperature=0.0
+        )
+        quick_summary = json.loads(clean_json(quick_raw))
+    except Exception:
+        quick_summary = {"primary_diagnosis": note[:200], "comorbidities": []}
+
+    # Retrieve guidelines filtered to patient's actual conditions
+    relevant_guidelines = retrieve_relevant_guidelines(note, summary=quick_summary, k=12)
+    guidelines_text     = "\n".join([f"- {g}" for g in relevant_guidelines])
+
+    system_prompt = """You are a clinical quality specialist reviewing patient records
+against evidence-based clinical guidelines.
+Always respond with valid JSON only — no markdown, no explanation."""
+
+    user_prompt = f"""
+Review this patient's clinical note against the provided guidelines.
+Identify any care gaps — things that SHOULD have been done but are missing or overdue.
+
+Return JSON in this exact format:
+{{
+  "gaps": [
+    {{
+      "gap": "short name of the gap",
+      "guideline": "the specific guideline being violated",
+      "recommendation": "what should be done",
+      "priority": "HIGH or MEDIUM or LOW"
+    }}
+  ],
+  "summary": "one sentence overall assessment of this patient's care quality"
+}}
+
+Only flag genuine gaps — things clearly missing based on the note.
+If the note mentions something was already done, do NOT flag it as a gap.
+Only flag heart failure guidelines if heart failure is a documented diagnosis.
+Only flag CKD guidelines if CKD or renal disease is a documented diagnosis.
+Do not apply guidelines from conditions the patient does not have.
+
+CLINICAL GUIDELINES:
+{guidelines_text}
+
+PATIENT NOTE:
+{note}
+"""
+
+    raw = get_claude_response(system_prompt, user_prompt,
+                              max_tokens=max_tokens, temperature=temperature)
+    raw = clean_json(raw)
+
+    try:
+        raw_dict   = json.loads(raw)
+        gap_result = CareGapResult(**raw_dict)
+        gaps       = gap_result.dict()
+    except json.JSONDecodeError:
+        return f"<h3>JSON parsing failed:</h3><pre>{raw}</pre>"
+    except Exception as e:
+        print(f"Care gap validation error: {e}")
+        gaps = {"gaps": [], "summary": "Validation error — could not parse care gaps."}
+
+    ##return render_template_string(TEMPLATE, **base_context(gaps=gaps, note_text=note))
+    return render_template_string(TEMPLATE, **base_context(gaps=gaps, note_text=note, active_tab="gaps"))
+
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    raw_urls       = request.form.get("urls", "").strip()
+    urls           = [u.strip() for u in raw_urls.splitlines() if u.strip()]
+    auto_summarize = request.form.get("auto_summarize") == "on"
+
+    if not urls:
+        return render_template_string(TEMPLATE, **base_context(active_tab="ingest"))
+
+    # ── Async scraping — all URLs at once ──
+    scraped = asyncio.run(scrape_urls_async(urls))
+
+    ingest_results = []
+    for url, text, error in scraped:
+        if text:
+            # Always index in ChromaDB
+            chunks_added = index_note(url, text)
+            result = {
+                "url":        url,
+                "success":    True,
+                "chunks":     chunks_added,
+                "patient_id": None,
+                "error":      None
+            }
+
+            # Auto-summarize — only if checkbox ticked
+            if auto_summarize:
+                try:
+                    system_prompt = """You are a clinical documentation specialist.
+Extract structured information from the clinical note provided.
+Always respond with valid JSON only — no markdown, no explanation."""
+
+                    user_prompt = f"""Extract the following from this clinical note and return as JSON:
+{{
+  "primary_diagnosis": "main diagnosis as a string",
+  "comorbidities": ["list of other conditions"],
+  "medications": ["list of current medications with doses if mentioned"],
+  "key_findings": ["list of important clinical findings, lab values, vitals"],
+  "risk_flags": ["list of urgent concerns that need immediate attention"],
+  "follow_up_actions": ["list of recommended follow-up actions"]
+}}
+Clinical Note:
+{text[:3000]}"""
+
+                    raw       = get_claude_response(system_prompt, user_prompt)
+                    raw       = clean_json(raw)
+                    summary   = json.loads(raw)
+                    patient_id = save_patient(summary, text)
+
+                    # Save to ChromaDB with patient_id linked
+                    flag_count = len(summary.get("risk_flags", []))
+                    risk_level = "HIGH" if flag_count >= 3 else "MEDIUM" if flag_count >= 1 else "LOW"
+                    notes_collection.upsert(vectors=[{
+                        "id":       f"patient_{patient_id}",
+                        "vector":   get_embedding(text[:1000]),
+                        "data":     text[:1000],
+                        "metadata": {
+                            "patient_id":        patient_id,
+                            "primary_diagnosis": summary.get("primary_diagnosis", ""),
+                            "risk_level":        risk_level,
+                            "url":               "manual_entry",
+                            "chunk":             0
+                        }
+                    }])
+                    result["patient_id"] = patient_id
+
+                except Exception as e:
+                    result["error"] = f"Summarize failed: {str(e)}"
+
+            ingest_results.append(result)
+
+        else:
+            ingest_results.append({
+                "url":        url,
+                "success":    False,
+                "chunks":     0,
+                "patient_id": None,
+                "error":      error
+            })
+
+    return render_template_string(TEMPLATE, **base_context(
+        ingest_results=ingest_results,
+        active_tab="ingest"
+    ))
+
+
+@app.route("/search", methods=["POST"])
+def search():
+    query = request.form.get("query", "").strip()
+    if not query:
+        return render_template_string(TEMPLATE, **base_context(
+            search_query=query, search_results=[]
+        ))
+    results = search_notes(query, top_k=5)
+    return render_template_string(TEMPLATE, **base_context(search_results=results, search_query=query, active_tab="search"))
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    question = request.form.get("question", "").strip()
+    if not question:
+        return render_template_string(TEMPLATE, **base_context(
+            active_tab="ask"
+        ))
+
+    # Step 1 — retrieve relevant chunks
+    results = search_notes(question, top_k=6)
+    if not results:
+        return render_template_string(TEMPLATE, **base_context(
+            active_tab="ask",
+            ask_question=question,
+            ask_answer="No relevant notes found. Please ingest more clinical notes first.",
+            ask_sources=[]
+        ))
+
+    # Step 2 — build context from retrieved chunks
+    context_blocks = []
+    sources = []
+    for i, (doc, meta) in enumerate(results):
+        context_blocks.append(f"[Source {i+1}]\n{doc}")
+        sources.append(meta.get("url", "manual_entry"))
+
+    context = "\n\n---\n\n".join(context_blocks)
+
+    # Step 3 — ask Claude to synthesize
+    system_prompt = """You are a clinical AI assistant helping healthcare professionals 
+query and understand patient records.
+
+You will be given several clinical note excerpts as context, followed by a question.
+Answer the question based ONLY on the provided context.
+Always cite which sources you used (Source 1, Source 2 etc.).
+If the answer is not in the context, say so clearly — do not hallucinate.
+Be concise but clinically precise."""
+
+    user_prompt = f"""CLINICAL NOTES CONTEXT:
+{context}
+
+QUESTION: {question}
+
+Answer based only on the above context. Cite your sources."""
+
+    answer = get_claude_response(system_prompt, user_prompt, max_tokens=1500, temperature=0.0)
+
+    return render_template_string(TEMPLATE, **base_context(
+        active_tab="ask",
+        ask_question=question,
+        ask_answer=answer,
+        ask_sources=list(zip(range(1, len(sources)+1), sources)),
+        ask_chunks=results
+    ))
+
+@app.route("/patients")
+def patients():
+    risk_filter  = request.args.get("risk", None)
+    patient_list = get_patients_by_risk(risk_filter) if risk_filter else get_all_patients()
+    return render_template_string(TEMPLATE, **base_context(patients=patient_list, active_tab="patients"))
+
+
+@app.route("/patient/<patient_id>")
+def patient_detail(patient_id):
+    patient = get_patient_by_id(patient_id)
+    if not patient:
+        return "<h3>Patient not found</h3>"
+    for field in ["comorbidities", "medications", "key_findings",
+                  "risk_flags", "follow_up_actions"]:
+        try:
+            patient[field] = json.loads(patient[field])
+        except Exception:
+            patient[field] = []
+    return render_template_string(PATIENT_DETAIL_TEMPLATE, patient=patient)
+
+
+# ─────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(debug=False, host="0.0.0.0", port=port)

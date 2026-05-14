@@ -1,0 +1,14 @@
+flask
+anthropic
+python-dotenv
+requests
+beautifulsoup4
+faiss-cpu
+numpy
+httpx
+tenacity
+pydantic
+google-cloud-bigquery
+google-cloud-storage
+google-cloud-aiplatform
+upstash-vector
