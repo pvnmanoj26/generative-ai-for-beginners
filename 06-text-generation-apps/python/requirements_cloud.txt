@@ -1,4 +1,6 @@
 flask
+fastapi
+uvicorn[standard]
 anthropic
 python-dotenv
 requests

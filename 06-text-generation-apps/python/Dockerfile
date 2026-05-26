@@ -10,8 +10,8 @@ RUN apt-get update && apt-get install -y \
 COPY requirements_cloud.txt .
 RUN pip install --no-cache-dir -r requirements_cloud.txt
 
-COPY clinical_app_cloud_v01.py .
+COPY clinical_api.py .
 
 EXPOSE 8080
 
-CMD ["python", "clinical_app_cloud_v01.py"]
+CMD ["uvicorn", "clinical_api:app", "--host", "0.0.0.0", "--port", "8080"]

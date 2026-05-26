@@ -1,0 +1,428 @@
+{
+  "file_name": "patients.csv",
+  "mapping_source": "ai",
+  "mappings": [
+    {
+      "source_column": "Id",
+      "target_field": "patient_id",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "UUID format with 50 distinct values across 50 rows indicates stable patient identifier",
+      "sample_values": [
+        "6383af50-c8f6-0c22-1dd4-6ee2be572cb1",
+        "b23941a4-269e-2ac4-8ced-75d1ac8b1b1d"
+      ],
+      "semantic_hints": [
+        "unique_identifier",
+        "uuid_format"
+      ]
+    },
+    {
+      "source_column": "BIRTHDATE",
+      "target_field": "demographics.birth_date",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and date format (YYYY-MM-DD) clearly indicate birth date",
+      "sample_values": [
+        "2023-04-26",
+        "1981-05-06",
+        "1967-07-10"
+      ],
+      "semantic_hints": [
+        "date_type",
+        "birth_related"
+      ]
+    },
+    {
+      "source_column": "DEATHDATE",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Death date is not in target schema; no event.end_date mapping for patient-level mortality",
+      "sample_values": [
+        "1992-04-07",
+        "2017-09-17"
+      ],
+      "semantic_hints": [
+        "date_type",
+        "mortality_indicator"
+      ]
+    },
+    {
+      "source_column": "SSN",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Social Security Number not in target schema; sensitive identifier without mapping",
+      "sample_values": [
+        "999-28-4653",
+        "999-56-8666"
+      ],
+      "semantic_hints": [
+        "personal_identifier",
+        "sensitive_data"
+      ]
+    },
+    {
+      "source_column": "DRIVERS",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Driver license identifier not in target schema",
+      "sample_values": [
+        "S99949034",
+        "S99923766"
+      ],
+      "semantic_hints": [
+        "personal_identifier"
+      ]
+    },
+    {
+      "source_column": "PASSPORT",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Passport identifier not in target schema",
+      "sample_values": [
+        "X15329517X",
+        "X19183901X"
+      ],
+      "semantic_hints": [
+        "personal_identifier"
+      ]
+    },
+    {
+      "source_column": "PREFIX",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Name prefix (Mr., Mrs.) not in target schema; could be part of demographics but no dedicated field",
+      "sample_values": [
+        "Mrs.",
+        "Mr."
+      ],
+      "semantic_hints": [
+        "name_component"
+      ]
+    },
+    {
+      "source_column": "FIRST",
+      "target_field": "demographics.first_name",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name 'FIRST' and sample values (Agnus790, Maritza144) clearly indicate first names",
+      "sample_values": [
+        "Agnus790",
+        "Maritza144",
+        "Candra395"
+      ],
+      "semantic_hints": [
+        "name_component",
+        "given_name"
+      ]
+    },
+    {
+      "source_column": "MIDDLE",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Middle name not in target schema; no field for middle name component",
+      "sample_values": [
+        "Alaine226",
+        "Yolonda722"
+      ],
+      "semantic_hints": [
+        "name_component"
+      ]
+    },
+    {
+      "source_column": "LAST",
+      "target_field": "demographics.last_name",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name 'LAST' and sample values (Shields502, Wilderman619) clearly indicate last/family names",
+      "sample_values": [
+        "Shields502",
+        "Wilderman619",
+        "Stamm704"
+      ],
+      "semantic_hints": [
+        "name_component",
+        "family_name"
+      ]
+    },
+    {
+      "source_column": "SUFFIX",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Name suffix not in target schema; only 1 non-null value (JD)",
+      "sample_values": [
+        "JD"
+      ],
+      "semantic_hints": [
+        "name_component"
+      ]
+    },
+    {
+      "source_column": "MAIDEN",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Maiden name not in target schema; no field for historical name variants",
+      "sample_values": [
+        "Jacobson885",
+        "Corkery305"
+      ],
+      "semantic_hints": [
+        "name_component",
+        "historical_name"
+      ]
+    },
+    {
+      "source_column": "MARITAL",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Marital status (M, S, D) not in target schema; no demographics field for marital status",
+      "sample_values": [
+        "M",
+        "S",
+        "D"
+      ],
+      "semantic_hints": [
+        "gender_like",
+        "marital_status"
+      ]
+    },
+    {
+      "source_column": "RACE",
+      "target_field": "demographics.race",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and values (white, asian) directly match target field for race",
+      "sample_values": [
+        "white",
+        "asian"
+      ],
+      "semantic_hints": [
+        "demographic_category"
+      ]
+    },
+    {
+      "source_column": "ETHNICITY",
+      "target_field": "demographics.ethnicity",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and values (hispanic, nonhispanic) directly match target field for ethnicity",
+      "sample_values": [
+        "nonhispanic",
+        "hispanic"
+      ],
+      "semantic_hints": [
+        "demographic_category"
+      ]
+    },
+    {
+      "source_column": "GENDER",
+      "target_field": "demographics.gender",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and values (M, F) clearly indicate administrative gender",
+      "sample_values": [
+        "F",
+        "M"
+      ],
+      "semantic_hints": [
+        "gender_like",
+        "administrative_gender"
+      ]
+    },
+    {
+      "source_column": "BIRTHPLACE",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Birth place (city, state, country) not in target schema; could decompose but no dedicated field",
+      "sample_values": [
+        "Auburn  Massachusetts  US",
+        "Adams  Massachusetts  US"
+      ],
+      "semantic_hints": [
+        "location_data",
+        "birth_related"
+      ]
+    },
+    {
+      "source_column": "ADDRESS",
+      "target_field": "demographics.address",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and street address format (851 Hayes Port) match target field",
+      "sample_values": [
+        "851 Hayes Port",
+        "456 Erdman Crossroad",
+        "860 Stiedemann Trafficway"
+      ],
+      "semantic_hints": [
+        "street_address"
+      ]
+    },
+    {
+      "source_column": "CITY",
+      "target_field": "demographics.city",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and values (Wakefield, Marion, Attleboro) directly match target field",
+      "sample_values": [
+        "Wakefield",
+        "Marion",
+        "Attleboro"
+      ],
+      "semantic_hints": [
+        "location_component"
+      ]
+    },
+    {
+      "source_column": "STATE",
+      "target_field": "demographics.state",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and values (Massachusetts) directly match target field for state",
+      "sample_values": [
+        "Massachusetts"
+      ],
+      "semantic_hints": [
+        "location_component"
+      ]
+    },
+    {
+      "source_column": "COUNTY",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "County information not in target schema; finer geographic granularity than state",
+      "sample_values": [
+        "Middlesex County",
+        "Plymouth County"
+      ],
+      "semantic_hints": [
+        "location_component"
+      ]
+    },
+    {
+      "source_column": "FIPS",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "FIPS code (numeric identifier for geographic areas) not in target schema",
+      "sample_values": [
+        "25017",
+        "44007"
+      ],
+      "semantic_hints": [
+        "numeric_clinical_code_or_identifier",
+        "geographic_code"
+      ]
+    },
+    {
+      "source_column": "ZIP",
+      "target_field": "demographics.zip_code",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column name and numeric postal code format (01880, 02861) match target field",
+      "sample_values": [
+        "01880",
+        "02861",
+        "01940"
+      ],
+      "semantic_hints": [
+        "postal_code"
+      ]
+    },
+    {
+      "source_column": "LAT",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Latitude coordinate not in target schema; geographic coordinate data",
+      "sample_values": [
+        "42.540962455867785",
+        "41.68974931768348"
+      ],
+      "semantic_hints": [
+        "geographic_coordinate"
+      ]
+    },
+    {
+      "source_column": "LON",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Longitude coordinate not in target schema; geographic coordinate data",
+      "sample_values": [
+        "-71.09499698412891",
+        "-70.72408273808081"
+      ],
+      "semantic_hints": [
+        "geographic_coordinate"
+      ]
+    },
+    {
+      "source_column": "HEALTHCARE_EXPENSES",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Healthcare expenses (financial summary) not in target schema; could map to event.value but lacks event context",
+      "sample_values": [
+        "7415.66",
+        "28794.64",
+        "374752.86"
+      ],
+      "semantic_hints": [
+        "financial_value",
+        "healthcare_cost"
+      ]
+    },
+    {
+      "source_column": "HEALTHCARE_COVERAGE",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Healthcare coverage (financial summary) not in target schema; lacks event context for mapping",
+      "sample_values": [
+        "0.00",
+        "51221.77",
+        "32515.01"
+      ],
+      "semantic_hints": [
+        "financial_value",
+        "insurance_coverage"
+      ]
+    },
+    {
+      "source_column": "INCOME",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Income (socioeconomic data) not in target schema; no demographics or event field for income",
+      "sample_values": [
+        "468300",
+        "110497",
+        "55938"
+      ],
+      "semantic_hints": [
+        "numeric_clinical_code_or_identifier",
+        "socioeconomic_data"
+      ]
+    }
+  ],
+  "warnings": [
+    "This is a patient demographics file with no clinical events. Target schema includes event fields (event.event_type, event.code, etc.) that cannot be populated from this source.",
+    "Multiple columns (DEATHDATE, SSN, DRIVERS, PASSPORT, MARITAL, BIRTHPLACE, COUNTY, FIPS, LAT, LON, HEALTHCARE_EXPENSES, HEALTHCARE_COVERAGE, INCOME) have no mappings in the target schema.",
+    "Name components (PREFIX, MIDDLE, SUFFIX, MAIDEN) are present but target schema only supports first_name and last_name.",
+    "Financial data (HEALTHCARE_EXPENSES, HEALTHCARE_COVERAGE, INCOME) cannot be mapped without event context.",
+    "Geographic coordinates (LAT, LON) and FIPS codes are not supported in target schema."
+  ],
+  "approved": true
+}

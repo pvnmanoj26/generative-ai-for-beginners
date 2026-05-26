@@ -1,0 +1,126 @@
+{
+  "file_name": "conditions.csv",
+  "mapping_source": "ai",
+  "mappings": [
+    {
+      "source_column": "START",
+      "target_field": "event.start_date",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column contains dates in YYYY-MM-DD format with 100% non-null values. Semantically represents condition onset or start date.",
+      "sample_values": [
+        "2023-04-26",
+        "2024-07-03",
+        "2025-03-16",
+        "1999-06-30"
+      ],
+      "semantic_hints": [
+        "date",
+        "event_start"
+      ]
+    },
+    {
+      "source_column": "STOP",
+      "target_field": "event.end_date",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column contains dates in YYYY-MM-DD format with 74% non-null values. Semantically represents condition resolution or end date.",
+      "sample_values": [
+        "2024-04-03",
+        "2025-10-01",
+        "2025-03-30",
+        "2018-07-25"
+      ],
+      "semantic_hints": [
+        "date",
+        "event_end"
+      ]
+    },
+    {
+      "source_column": "PATIENT",
+      "target_field": "patient_id",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column contains stable UUID identifiers with 100% non-null values and 4 distinct patients. Clearly a patient identifier.",
+      "sample_values": [
+        "6383af50-c8f6-0c22-1dd4-6ee2be572cb1",
+        "5e236a28-42bb-348c-3267-03ed1a052b40",
+        "b23941a4-269e-2ac4-8ced-75d1ac8b1b1d"
+      ],
+      "semantic_hints": [
+        "uuid",
+        "patient_identifier"
+      ]
+    },
+    {
+      "source_column": "ENCOUNTER",
+      "target_field": "event.encounter_id",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column contains UUID identifiers with 100% non-null values and 43 distinct values. Semantically represents encounter or visit context.",
+      "sample_values": [
+        "6383af50-c8f6-0c22-80da-16d9600df316",
+        "6383af50-c8f6-0c22-e241-cbca88dadd51",
+        "5e236a28-42bb-348c-149c-bd6cfb9abcfb"
+      ],
+      "semantic_hints": [
+        "uuid",
+        "encounter_identifier"
+      ]
+    },
+    {
+      "source_column": "SYSTEM",
+      "target_field": null,
+      "confidence": 0.0,
+      "requires_review": true,
+      "reason": "Column contains coding system URI (SNOMED). This is metadata about the CODE column, not a direct target field. Should be used to validate code system but not mapped as standalone field.",
+      "sample_values": [
+        "http://snomed.info/sct"
+      ],
+      "semantic_hints": [
+        "code_system_uri",
+        "metadata"
+      ]
+    },
+    {
+      "source_column": "CODE",
+      "target_field": "event.code",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column contains numeric SNOMED codes (confirmed by SYSTEM column). 100% non-null with 26 distinct clinical codes. Clearly represents clinical event code.",
+      "sample_values": [
+        "314529007",
+        "65363002",
+        "444814009",
+        "473461003"
+      ],
+      "semantic_hints": [
+        "snomed_code",
+        "clinical_code"
+      ]
+    },
+    {
+      "source_column": "DESCRIPTION",
+      "target_field": "event.description",
+      "confidence": 0.99,
+      "requires_review": false,
+      "reason": "Column contains human-readable clinical descriptions matching SNOMED codes (e.g., 'Otitis media (disorder)'). 100% non-null with 26 distinct descriptions.",
+      "sample_values": [
+        "Medication review due (situation)",
+        "Otitis media (disorder)",
+        "Viral sinusitis (disorder)",
+        "Stress (finding)"
+      ],
+      "semantic_hints": [
+        "human_readable_description",
+        "clinical_description"
+      ]
+    }
+  ],
+  "warnings": [
+    "SYSTEM column contains coding system metadata (SNOMED URI). This should be preserved for validation but is not directly mapped to target schema.",
+    "No event.event_type field is explicitly provided. All records appear to be conditions based on file name and SNOMED codes. Consider adding a constant 'condition' value or deriving from code system.",
+    "No event.status field is provided in source data. Consider adding workflow status if available in upstream systems."
+  ],
+  "approved": true
+}
