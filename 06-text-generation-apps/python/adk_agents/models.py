@@ -351,8 +351,5 @@ class ClinicalPatientRecord(BaseModel):
     payer_transitions: list[PayerTransitionRow] = Field(default_factory=list)
     procedures: list[ClinicalEvent] = Field(default_factory=list)
     supplies: list[ClinicalEvent] = Field(default_factory=list)
+    events: list[ClinicalEvent] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-
-

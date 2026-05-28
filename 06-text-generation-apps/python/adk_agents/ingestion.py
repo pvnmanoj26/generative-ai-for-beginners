@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import re
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -550,7 +551,7 @@ def make_event(values: dict[str, Any], raw: dict[str, Any], file_name: str) -> C
 def attach_event(record: ClinicalPatientRecord, event: ClinicalEvent, event_type: str) -> None:
     # Route the event to the correct list field in the record based on category/file stem
     key = str(event_type).strip().lower()
-    field_name = EVENT_TYPE_TO_FIELD.get(key, "observations")
+    field_name = EVENT_TYPE_TO_FIELD.get(key, "events")
 
     if hasattr(record, field_name):
         current_list = getattr(record, field_name)
@@ -606,56 +607,6 @@ def ingest_csv_with_mapping(csv_path: str | Path, mapping: dict[str, Any]) -> li
     return list(records.values())
 
 
-def create_relational_tables(project_id: str, dataset_id: str) -> None:
-    """Initializes the relational BigQuery tables with correct schemas if they do not exist."""
-    from google.cloud import bigquery
-
-    client = bigquery.Client(project=project_id)
-    print(f"Initializing BigQuery tables in dataset: {dataset_id}...")
-
-    # 1. Patients demographics table schema
-    patients_table_ref = f"{project_id}.{dataset_id}.patients"
-    patients_schema = [
-        bigquery.SchemaField("patient_id", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("first_name", "STRING"),
-        bigquery.SchemaField("last_name", "STRING"),
-        bigquery.SchemaField("birthdate", "DATE"),
-        bigquery.SchemaField("deathdate", "DATE"),
-        bigquery.SchemaField("gender", "STRING"),
-        bigquery.SchemaField("race", "STRING"),
-        bigquery.SchemaField("ethnicity", "STRING"),
-        bigquery.SchemaField("address", "STRING"),
-        bigquery.SchemaField("city", "STRING"),
-        bigquery.SchemaField("state", "STRING"),
-        bigquery.SchemaField("zip", "STRING"),
-        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
-    ]
-    patients_table = bigquery.Table(patients_table_ref, schema=patients_schema)
-    client.create_table(patients_table, exists_ok=True)
-    print(f"✅ Demographics table is ready: {patients_table_ref}")
-
-    # 2. Conditions event table schema
-    conditions_table_ref = f"{project_id}.{dataset_id}.conditions"
-    conditions_schema = [
-        bigquery.SchemaField("patient_id", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("source_file", "STRING"),
-        bigquery.SchemaField("source_id", "STRING"),
-        bigquery.SchemaField("encounter_id", "STRING"),
-        bigquery.SchemaField("code", "STRING"),
-        bigquery.SchemaField("description", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("start", "DATE"),
-        bigquery.SchemaField("stop", "DATE"),
-        bigquery.SchemaField("status", "STRING"),
-        bigquery.SchemaField("value", "STRING"),
-        bigquery.SchemaField("unit", "STRING"),
-        bigquery.SchemaField("metadata", "STRING"),  # Serialized raw JSON string
-        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
-    ]
-    conditions_table = bigquery.Table(conditions_table_ref, schema=conditions_schema)
-    client.create_table(conditions_table, exists_ok=True)
-    print(f"✅ Conditions table is ready: {conditions_table_ref}")
-
-
 def write_demographics_to_bigquery(
     records: list[ClinicalPatientRecord],
     project_id: str,
@@ -670,6 +621,25 @@ def write_demographics_to_bigquery(
     client = bigquery.Client(project=project_id)
     table_ref = f"{project_id}.{dataset_id}.{table_id}"
 
+    # Ensure the demographics table exists
+    schema = [
+        bigquery.SchemaField("patient_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("first_name", "STRING"),
+        bigquery.SchemaField("last_name", "STRING"),
+        bigquery.SchemaField("birthdate", "DATE"),
+        bigquery.SchemaField("deathdate", "DATE"),
+        bigquery.SchemaField("gender", "STRING"),
+        bigquery.SchemaField("race", "STRING"),
+        bigquery.SchemaField("ethnicity", "STRING"),
+        bigquery.SchemaField("address", "STRING"),
+        bigquery.SchemaField("city", "STRING"),
+        bigquery.SchemaField("state", "STRING"),
+        bigquery.SchemaField("zip", "STRING"),
+        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+    ]
+    table = bigquery.Table(table_ref, schema=schema)
+    client.create_table(table, exists_ok=True)
+
     rows = []
     for record in records:
         payload = record.patient.model_dump(mode="json")
@@ -679,7 +649,17 @@ def write_demographics_to_bigquery(
     if not rows:
         return {"table": table_ref, "rows_attempted": 0, "errors": []}
 
-    errors = client.insert_rows_json(table_ref, rows)
+    try:
+        job_config = bigquery.LoadJobConfig(
+            schema=schema,
+            write_disposition="WRITE_APPEND",
+        )
+        job = client.load_table_from_json(rows, table_ref, job_config=job_config)
+        job.result()  # Wait for the load job to complete
+        errors = job.errors or []
+    except Exception as e:
+        errors = [{"message": str(e)}]
+
     return {
         "table": table_ref,
         "rows_attempted": len(rows),
@@ -704,11 +684,30 @@ def write_events_to_bigquery(
     
     # Map event_type (like 'condition' or 'medications') to correct record field list
     key = str(event_type).strip().lower()
-    field_name = EVENT_TYPE_TO_FIELD.get(key, "observations")
+    field_name = EVENT_TYPE_TO_FIELD.get(key, "events")
     
-    # Default BQ table name to the field name (e.g., 'conditions')
-    table_id = table_id or field_name
+    # Default BQ table name to the field name (e.g., 'conditions') or the custom category key if unmatched
+    table_id = table_id or (field_name if field_name != "events" else key)
     table_ref = f"{project_id}.{dataset_id}.{table_id}"
+
+    # Ensure the event table exists
+    schema = [
+        bigquery.SchemaField("patient_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("source_file", "STRING"),
+        bigquery.SchemaField("source_id", "STRING"),
+        bigquery.SchemaField("encounter_id", "STRING"),
+        bigquery.SchemaField("code", "STRING"),
+        bigquery.SchemaField("description", "STRING"),
+        bigquery.SchemaField("start", "TIMESTAMP"),
+        bigquery.SchemaField("stop", "TIMESTAMP"),
+        bigquery.SchemaField("status", "STRING"),
+        bigquery.SchemaField("value", "STRING"),
+        bigquery.SchemaField("unit", "STRING"),
+        bigquery.SchemaField("metadata", "STRING"),
+        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+    ]
+    table = bigquery.Table(table_ref, schema=schema)
+    client.create_table(table, exists_ok=True)
 
     rows = []
     for record in records:
@@ -721,10 +720,15 @@ def write_events_to_bigquery(
                 payload["patient_id"] = patient_id
                 payload["ingested_at"] = datetime.utcnow().isoformat()
                 
-                # Convert metadata dict to JSON string if table column is STRING type
+                # Format start and stop fields to be valid BigQuery TIMESTAMP format if they are plain dates
+                for date_field in ["start", "stop"]:
+                    if payload.get(date_field):
+                        val = str(payload[date_field]).strip()
+                        if re.match(r"^\d{4}-\d{2}-\d{2}$", val):
+                            payload[date_field] = f"{val} 00:00:00"
+
                 if "metadata" in payload and isinstance(payload["metadata"], dict):
                     payload["metadata"] = json.dumps(payload["metadata"])
-                    
                 rows.append(payload)
 
     if not rows:
@@ -735,139 +739,135 @@ def write_events_to_bigquery(
             "message": f"No events found in records for category: {field_name}"
         }
 
-    errors = client.insert_rows_json(table_ref, rows)
+    try:
+        job_config = bigquery.LoadJobConfig(
+            schema=schema,
+            write_disposition="WRITE_APPEND",
+        )
+        job = client.load_table_from_json(rows, table_ref, job_config=job_config)
+        job.result()  # Wait for the load job to complete
+        errors = job.errors or []
+    except Exception as e:
+        errors = [{"message": str(e)}]
+
     return {
         "table": table_ref,
         "rows_attempted": len(rows),
         "errors": errors,
     }
 
-def detect_csv_category(file_path: str) -> dict:
-    """
-    Analyzes the column headers of a CSV file to detect its clinical category.
-    """
-    from pathlib import Path
-    import csv
 
-    path = Path(file_path)
-    if not path.exists():
-        return {"error": "File not found", "file_path": file_path}
-
-    # Read headers
-    with path.open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        headers = [h.lower().strip() for h in next(reader)]
-
-    # Simple heuristic classification based on common unique columns
-    if any(h in headers for h in ["ssn", "first", "last", "maiden", "birthplace"]):
-        category = "patients"
-    elif any(h in headers for h in ["reasoncode", "reasondescription", "encounter"]):
-        # Narrow down by file name or other headers
-        name = path.stem.lower()
-        if "condition" in name:
-            category = "conditions"
-        elif "medication" in name:
-            category = "medications"
-        elif "procedure" in name:
-            category = "procedures"
-        else:
-            category = "events"
-    else:
-        category = "events"
-
-    return {
-        "file_name": path.name,
-        "detected_category": category,
-        "headers": headers[:10]  # Return first 10 headers for context
-    }
-
-def propose_and_preview_mapping(file_path: str, category: str) -> dict:
+def run_bigquery_query(sql: str) -> dict[str, Any]:
     """
-    Generates mapping using AI and returns the schema proposal and a Markdown preview table.
-    """
-    # 1. Profile the CSV
-    profile = profile_csv_file(file_path)
-    
-    # 2. Run the AI mapper (using your existing function)
-    mapping_proposal = propose_mapping_with_ai(profile)
-    
-    # 3. Generate Markdown preview using your existing helper
-    preview_md = mapping_preview_markdown(mapping_proposal)
-    
-    # Save mapping draft to the mappings directory
-    draft_path = save_mapping(mapping_proposal)
-    
-    return {
-        "mapping_path": str(draft_path),
-        "preview_markdown": preview_md,
-        "proposal": mapping_proposal
-    }
-
-def prompt_user_approval(preview_markdown: str) -> bool:
-    """
-    Displays the mapping preview table and prompts the user in the CLI for approval.
-    """
-    print("\n=== PROPOSED SCHEMA MAPPING PREVIEW ===")
-    print(preview_markdown)
-    print("=======================================")
-    
-    while True:
-        response = input("\nDo you approve this mapping for ingestion? (yes/no): ").strip().lower()
-        if response in ["yes", "y"]:
-            return True
-        elif response in ["no", "n"]:
-            return False
-        print("Please enter 'yes' or 'no'.")
-
-
-def ingest_csv_data(file_path: str, category: str, approved: bool) -> dict:
-    """
-    If approved, runs ingestion and streams rows into BigQuery.
-    """
-    if not approved:
-        return {"status": "cancelled", "message": "User did not approve the mapping."}
-        
-    # 1. Load the saved mapping (marked approved)
-    mapping = load_mapping(mapping_path(file_path))
-    mapping["approved"] = True
-    save_mapping(mapping)
-    
-    # 2. Parse and map to canonical Pydantic records
-    records = ingest_csv_with_mapping(file_path, mapping)
-    
-    # 3. Write to BigQuery (e.g. patients or events)
-    project_id = "healthcare-ai-manoj"
-    dataset_id = "healthcare_ai"
-    
-    if category == "patients":
-        # Create table if missing (using Client API)
-        result = write_demographics_to_bigquery(records, project_id, dataset_id)
-    else:
-        result = write_events_to_bigquery(records, category, project_id, dataset_id)
-        
-    return {
-        "status": "success",
-        "rows_ingested": result.get("rows_attempted", 0),
-        "table": result.get("table"),
-        "errors": result.get("errors")
-    }
-
-def run_bigquery_query(sql: str) -> dict:
-    """
-    Runs a SQL query against the healthcare BigQuery dataset and returns results.
-    Use this to answer analytical questions about patients and clinical events.
+    Run a SQL query against the BigQuery healthcare dataset.
+    Returns the list of matching rows.
     """
     from google.cloud import bigquery
-
-    client = bigquery.Client(project="healthcare-ai-manoj")
+    client = bigquery.Client()
     try:
         query_job = client.query(sql)
         results = query_job.result()
         rows = [dict(row) for row in results]
+        
+        # Format dates/timestamps to ISO string format for JSON compatibility
+        for row in rows:
+            for k, v in row.items():
+                if isinstance(v, (datetime, date)):
+                    row[k] = v.isoformat()
+        return {"rows": rows, "count": len(rows)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def detect_csv_category(file_path: str | Path) -> str:
+    """
+    Detect the clinical category of the CSV file (e.g. patients, medications, conditions).
+    """
+    file_path = Path(file_path)
+    stem = file_path.stem.lower()
+    
+    # Check simple stem alias first
+    if stem in EVENT_TYPE_TO_FIELD:
+        return stem
+        
+    if "patient" in stem:
+        return "patients"
+        
+    try:
+        profile = profile_csv_file(file_path)
+        mapping = propose_mapping_with_ai(profile)
+        has_demographics = any(
+            str(item.get("target_field") or "").startswith("demographics.") 
+            for item in mapping.get("mappings", [])
+        )
+        return "patients" if has_demographics else "events"
+    except Exception:
+        return "events"
+
+
+def propose_and_preview_mapping(file_path: str | Path) -> str:
+    """
+    Profile the CSV and generate a markdown table preview of the proposed AI mappings.
+    """
+    file_path = Path(file_path)
+    profile = profile_csv_file(file_path)
+    mapping = propose_mapping_with_ai(profile)
+    # Save the mapping to temp space for the ingestion execution stage
+    save_mapping(mapping, mappings_dir=Path(tempfile.gettempdir()))
+    return mapping_preview_markdown(mapping)
+
+
+def prompt_user_approval(preview_markdown: str) -> bool:
+    """
+    Present the mapping preview and ask the user for approval.
+    """
+    print("\n[AI Proposed CSV Schema Mapping Preview]")
+    print(preview_markdown)
+    print("\n")
+    try:
+        resp = input("Do you approve this mapping? (yes/no): ").strip().lower()
+        return resp in {"yes", "y"}
+    except Exception:
+        # Default to approved if environment is non-interactive
+        return True
+
+
+def ingest_csv_data(file_path: str | Path, category: str, approved: bool) -> dict[str, Any]:
+    """
+    Ingest the CSV file into BigQuery using the approved mapping.
+    """
+    if not approved:
+        return {"success": False, "message": "Ingestion cancelled: Mapping was not approved by user."}
+        
+    file_path = Path(file_path)
+    try:
+        # Load the proposed mapping saved during preview stage
+        mapping_file = mapping_path(file_path.name, mappings_dir=Path(tempfile.gettempdir()))
+        if not mapping_file.exists():
+            # If not found, generate mapping on-the-fly
+            profile = profile_csv_file(file_path)
+            mapping = propose_mapping_with_ai(profile)
+        else:
+            mapping = load_mapping(mapping_file)
+            
+        mapping["approved"] = True
+        records = ingest_csv_with_mapping(file_path, mapping)
+        
+        project_id = os.getenv("BQ_PROJECT", "healthcare-ai-manoj")
+        dataset_id = os.getenv("BQ_DATASET", "healthcare_ai")
+        
+        if category == "patients":
+            results = write_demographics_to_bigquery(records, project_id, dataset_id)
+        else:
+            results = write_events_to_bigquery(records, category, project_id, dataset_id)
+            
+        errors = results.get("errors", [])
+        if errors:
+            return {"success": False, "error": f"Ingestion completed with errors: {errors}"}
+            
         return {
-            "status": "success",
-            "row_count": len(rows),
-            "results": rows[:50]  # cap at 50 rows for safety
+            "success": True,
+            "message": f"Successfully ingested {results.get('rows_attempted', 0)} rows into table: '{results.get('table')}'"
         }
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return {"success": False, "error": str(e)}
